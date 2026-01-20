@@ -143,7 +143,7 @@ def index():
 def api_state():
     with lock:
         return jsonify(STATE)
-    bb
+
 
 # =====================================================
 # EMBEDDED UI (SINGLE FILE)
