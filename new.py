@@ -4,6 +4,8 @@ import time
 import ssl
 import threading
 import logging
+import os
+
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Any
@@ -11,15 +13,15 @@ from typing import Dict, Optional, Any
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
-import os
+
 # =====================================================
 # CONFIGURATION
 # =====================================================
 class Config:
-    MQTT_BROKER = os.getenv("MQTT_BROKER", "t569f61e.ala.asia-southeast1.emqxsl.com")
-    MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
-    MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
-    MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+    MQTT_BROKER = "t569f61e.ala.asia-southeast1.emqxsl.com"
+    MQTT_PORT = 8883
+    MQTT_USERNAME = "KH-01-device"
+    MQTT_PASSWORD = "Radiation0-Disperser8-Sternum1-Trio4"
     
     TOPICS = {
         "temperature": [
@@ -1843,7 +1845,7 @@ if __name__ == "__main__":
     
     # Start Flask application
     try:
-        port = int(os.environ.get("PORT", 5000))
+        port = int(os.environ.get("PORT", "5000"))
 
         socketio.run(
             app,
@@ -1853,6 +1855,7 @@ if __name__ == "__main__":
             use_reloader=False,
             allow_unsafe_werkzeug=True
         )
+
     except KeyboardInterrupt:
         logging.info("Dashboard shutting down...")
     except Exception as e:

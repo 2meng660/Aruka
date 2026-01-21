@@ -1,0 +1,7 @@
+*.log
+kh01_dashboard.log
+dashboard.log
+__pycache__/
+*.pyc
+.env
+venv/
