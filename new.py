@@ -1837,17 +1837,59 @@ DASH_HTML = """
 # =====================================================
 # START MQTT ONCE (WORKS ON RENDER + LOCAL)
 # =====================================================
+
+# =====================================================
+# START MQTT IN EVENTLET-SAFE BACKGROUND TASK
+# =====================================================
 _mqtt_started = False
+
+def start_mqtt_client():
+    """Start and maintain MQTT connection (reconnect forever)."""
+    while True:
+        try:
+            client = mqtt.Client(
+                client_id=f"kh01-dashboard-{int(time.time())}",
+                protocol=mqtt.MQTTv311,
+                clean_session=True
+            )
+
+            client.enable_logger(logging.getLogger("paho"))
+            client.username_pw_set(Config.MQTT_USERNAME, Config.MQTT_PASSWORD)
+
+            client.tls_set(
+                ca_certs=certifi.where(),
+                tls_version=ssl.PROTOCOL_TLS_CLIENT
+            )
+            client.tls_insecure_set(False)
+
+            client.on_connect = on_mqtt_connect
+            client.on_disconnect = on_mqtt_disconnect
+            client.on_message = on_mqtt_message
+
+            # IMPORTANT: make loop handle reconnect automatically
+            client.reconnect_delay_set(min_delay=1, max_delay=30)
+
+            logging.info("🔌 Connecting to MQTT broker...")
+            client.connect(Config.MQTT_BROKER, Config.MQTT_PORT, keepalive=60)
+
+            # Run network loop (will return if connection breaks)
+            client.loop_forever(retry_first_connection=True)
+
+        except Exception as e:
+            logging.error(f"💥 MQTT connection error: {e}")
+            time.sleep(5)  # retry
 
 def start_background_services():
     global _mqtt_started
     if _mqtt_started:
         return
     _mqtt_started = True
-    threading.Thread(target=start_mqtt_client, daemon=True).start()
-    logging.getLogger().info("✅ MQTT background thread started")
 
-# Start immediately when gunicorn imports the module (Render)
+    # eventlet-safe background task (DON'T use threading.Thread here)
+    socketio.start_background_task(start_mqtt_client)
+    logging.info("✅ MQTT background task started")
+
+# Start when module is imported by gunicorn (Render)
 start_background_services()
 
 if __name__ == "__main__":
