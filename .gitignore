@@ -1,4 +1,25 @@
-*.log
+# Python
 __pycache__/
-.env
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
 venv/
+.venv/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
