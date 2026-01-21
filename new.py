@@ -23,6 +23,8 @@ from typing import Dict, Optional
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 # =====================================================
 # CONFIGURATION
 # =====================================================
@@ -236,8 +238,10 @@ def prepare_websocket_data():
                 "uptime": state.uptime_seconds,
                 "message_count": state.message_count,
                 "data_rate": state.data_rate,
-                "last_update": state.last_update
+                "last_update": state.last_update,
+                "websocket_clients": state.websocket_clients
             },
+
             "health": asdict(state.health),
             "temperatures": {
                 key: {
@@ -1830,33 +1834,27 @@ DASH_HTML = """
 # START MQTT (RUNS ON RENDER/GUNICORN IMPORT)
 # =====================================================
 # IMPORTANT: This must be AFTER start_mqtt_client() is defined
-mqtt_thread = threading.Thread(target=start_mqtt_client, daemon=True)
-mqtt_thread.start()
-
-
 # =====================================================
-# LOCAL RUN ONLY (NOT USED ON RENDER)
+# START MQTT ONCE (WORKS ON RENDER + LOCAL)
 # =====================================================
+_mqtt_started = False
+
+def start_background_services():
+    global _mqtt_started
+    if _mqtt_started:
+        return
+    _mqtt_started = True
+    threading.Thread(target=start_mqtt_client, daemon=True).start()
+    logging.getLogger().info("✅ MQTT background thread started")
+
+# Start immediately when gunicorn imports the module (Render)
+start_background_services()
+
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
 
-    print("=" * 80)
-    print("KH-01 INDUSTRIAL CONTROL DASHBOARD")
-    print("=" * 80)
-    print("Starting Web Server (LOCAL TEST)...")
-    print("=" * 80)
+    start_background_services()
 
     port = int(os.environ.get("PORT", "5000"))
-    print(f"Starting Web Server on http://127.0.0.1:{port}")
-
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        debug=True,
-        use_reloader=False
-    )
-
+    socketio.run(app, host="0.0.0.0", port=port, debug=True, use_reloader=False)
