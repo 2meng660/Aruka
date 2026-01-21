@@ -1,0 +1,40 @@
+2026-01-20 22:23:15,174 - engineio.server - INFO - Server initialized for threading.
+2026-01-20 22:23:15,180 - __main__ - INFO - MQTT thread started
+2026-01-20 22:23:15,480 - __main__ - DEBUG - MQTT: Sending CONNECT (u1, p1, wr0, wq0, wf0, c1, k60) client_id=b'kh01-dashboard-1768922595'
+2026-01-20 22:23:15,568 - __main__ - DEBUG - MQTT: Received CONNACK (0, 0)
+2026-01-20 22:23:15,611 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m1) [(b'KH/site-01/KH-01/temperature_probe1', 0)]
+2026-01-20 22:23:15,611 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/temperature_probe1 (QoS: 0)
+2026-01-20 22:23:15,611 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m2) [(b'KH/site-01/KH-01/temperature_probe2', 0)]
+2026-01-20 22:23:15,612 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/temperature_probe2 (QoS: 0)
+2026-01-20 22:23:15,612 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m3) [(b'KH/site-01/KH-01/temperature_probe3', 0)]
+2026-01-20 22:23:15,612 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/temperature_probe3 (QoS: 0)
+2026-01-20 22:23:15,613 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m4) [(b'KH/site-01/KH-01/temperature_probe4', 0)]
+2026-01-20 22:23:15,613 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/temperature_probe4 (QoS: 0)
+2026-01-20 22:23:15,613 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m5) [(b'KH/site-01/KH-01/vfd_frequency', 0)]
+2026-01-20 22:23:15,614 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/vfd_frequency (QoS: 0)
+2026-01-20 22:23:15,614 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m6) [(b'KH/site-01/KH-01/power_consumption', 0)]
+2026-01-20 22:23:15,614 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/power_consumption (QoS: 0)
+2026-01-20 22:23:15,614 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m7) [(b'KH/site-01/KH-01/status', 0)]
+2026-01-20 22:23:15,615 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/status (QoS: 0)
+2026-01-20 22:23:15,615 - __main__ - DEBUG - MQTT: Sending SUBSCRIBE (d0, m8) [(b'KH/site-01/KH-01/#', 0)]
+2026-01-20 22:23:15,615 - __main__ - INFO -    Subscribed to KH/site-01/KH-01/# (QoS: 0)
+2026-01-20 22:23:15,615 - socketio.server - INFO - emitting event "mqtt" to all [/]
+2026-01-20 22:23:15,658 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,701 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,704 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,707 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,710 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,712 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,715 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,718 - __main__ - DEBUG - MQTT: Received SUBACK
+2026-01-20 22:23:15,721 - __main__ - DEBUG - MQTT: Received PUBLISH (d0, q0, r1, m0), 'KH/site-01/KH-01/test', ...  (22 bytes)
+2026-01-20 22:23:15,726 - __main__ - DEBUG -    Payload: {
+  "message": "hello"
+}
+2026-01-20 22:23:27,677 - werkzeug - INFO - [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.1.20:5000
+2026-01-20 22:23:27,678 - werkzeug - INFO - [33mPress CTRL+C to quit[0m
+2026-01-20 22:23:32,650 - werkzeug - INFO - 127.0.0.1 - - [20/Jan/2026 22:23:32] "GET / HTTP/1.1" 200 -
+2026-01-20 22:24:32,288 - werkzeug - INFO - 127.0.0.1 - - [20/Jan/2026 22:24:32] "GET / HTTP/1.1" 200 -
