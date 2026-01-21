@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
+"""
+KH-01 Industrial Control Dashboard
+Render-ready (Gunicorn + eventlet) + MQTT TLS (certifi) + detailed MQTT logs
+"""
+
+# IMPORTANT: eventlet monkey_patch must be FIRST
+import eventlet
+eventlet.monkey_patch()
+
+import os
 import json
 import time
 import ssl
+import uuid
 import threading
 import logging
-import os
-
+import certifi
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Any
+from typing import Dict, Optional
 
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
-
 # =====================================================
 # CONFIGURATION
 # =====================================================
@@ -81,12 +90,15 @@ class SystemHealth:
 # =====================================================
 # APPLICATION
 # =====================================================
+
 app = Flask(__name__)
-socketio = SocketIO(app, 
-                   async_mode="threading", 
+
+socketio = SocketIO(app,
+                   async_mode="eventlet",
                    cors_allowed_origins="*",
                    logger=False,
                    engineio_logger=False)
+
 
 # =====================================================
 # GLOBAL STATE
@@ -433,34 +445,36 @@ def start_mqtt_client():
                 protocol=mqtt.MQTTv311,
                 clean_session=True
             )
-            
+
+            # show detailed mqtt/tls logs in Render
+            client.enable_logger(logging.getLogger("paho"))
+
             client.username_pw_set(Config.MQTT_USERNAME, Config.MQTT_PASSWORD)
-            
-            # SSL/TLS configuration
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            client.tls_set_context(ssl_context)
-            client.tls_insecure_set(True)
-            
-            # Set callbacks
+
+            # SSL/TLS configuration (VERIFY CERT)
+            client.tls_set(
+                ca_certs=certifi.where(),
+                tls_version=ssl.PROTOCOL_TLS_CLIENT
+            )
+            client.tls_insecure_set(False)
+
+            # callbacks
             client.on_connect = on_mqtt_connect
             client.on_disconnect = on_mqtt_disconnect
             client.on_message = on_mqtt_message
-            
-            # Connection settings
+
+            # reconnect settings
             client.reconnect_delay_set(min_delay=1, max_delay=30)
-            client.connect_timeout = 10
-            
-            logging.info(f"🔌 Connecting to MQTT broker...")
+
+            logging.info("🔌 Connecting to MQTT broker...")
             client.connect(Config.MQTT_BROKER, Config.MQTT_PORT, keepalive=60)
-            
-            # Start network loop
+
             client.loop_forever()
-            
+
         except Exception as e:
             logging.error(f"💥 MQTT connection error: {e}")
-            time.sleep(5)  # Wait before retry
+            time.sleep(5)
+
 
 # =====================================================
 # WEB SOCKET HANDLERS
@@ -1812,51 +1826,37 @@ DASH_HTML = """
 # =====================================================
 # MAIN EXECUTION
 # =====================================================
+# =====================================================
+# START MQTT (RUNS ON RENDER/GUNICORN IMPORT)
+# =====================================================
+# IMPORTANT: This must be AFTER start_mqtt_client() is defined
+mqtt_thread = threading.Thread(target=start_mqtt_client, daemon=True)
+mqtt_thread.start()
+
+
+# =====================================================
+# LOCAL RUN ONLY (NOT USED ON RENDER)
+# =====================================================
 if __name__ == "__main__":
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('kh01_dashboard.log')
-        ]
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    
-    # Print startup banner
+
     print("=" * 80)
     print("KH-01 INDUSTRIAL CONTROL DASHBOARD")
     print("=" * 80)
-    print(f"Version: 3.0.0")
-    print(f"MQTT Broker: {Config.MQTT_BROKER}:{Config.MQTT_PORT}")
-    print(f"Dashboard URL: http://127.0.0.1:5000")
-    print(f"API Endpoints:")
-    print(f"  • /              - Dashboard interface")
-    print(f"  • /api/status    - System status")
-    print(f"  • /api/data      - Current data")
-    print(f"  • /api/history   - Message history")
-    print(f"  • /api/reset     - Reset data (POST)")
-    print(f"\nStarting MQTT client...")
+    print("Starting Web Server (LOCAL TEST)...")
     print("=" * 80)
-    
-    # Start MQTT client in background thread
-    mqtt_thread = threading.Thread(target=start_mqtt_client, daemon=True)
-    mqtt_thread.start()
-    
-    # Start Flask application
-    try:
-        port = int(os.environ.get("PORT", "5000"))
 
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            debug=False,
-            use_reloader=False,
-            allow_unsafe_werkzeug=True
-        )
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"Starting Web Server on http://127.0.0.1:{port}")
 
-    except KeyboardInterrupt:
-        logging.info("Dashboard shutting down...")
-    except Exception as e:
-        logging.error(f"Failed to start dashboard: {e}")
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        debug=True,
+        use_reloader=False
+    )
+
