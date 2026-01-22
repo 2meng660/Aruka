@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-Render-ready Flask + SocketIO + MQTT (Single File)
+Render-ready Flask + SocketIO + MQTT (Single File) - Python 3.13 compatible
 
-Run on Render with:
-  gunicorn -k eventlet -w 1 app:app --bind 0.0.0.0:$PORT --log-level info
+Render Start Command:
+  gunicorn -w 1 app:app --bind 0.0.0.0:$PORT --log-level info
 
-Features:
-- eventlet async (WebSocket compatible)
-- one MQTT background loop (no duplicate loops)
-- stable reconnect logic
-- TLS with certifi (works on Render Linux)
-- simple HTML UI embedded (no templates folder needed)
+ENV vars (Render -> Environment):
+  MQTT_HOST   (required)
+  MQTT_PORT   (default 8883)
+  MQTT_USER   (optional)
+  MQTT_PASS   (optional)
+  MQTT_TOPIC  (default KH/site-01/#)
+  MQTT_TLS    (default 1)   1=tls, 0=plain
+  MQTT_CLIENT_ID (default KH-01-render)
+  SECRET_KEY  (optional)
+
+Notes:
+- No eventlet (because Render uses Python 3.13; eventlet breaks on 3.13)
+- SocketIO runs in "threading" mode (OK for dashboards / low-medium traffic)
 """
-state_lock = Semaphore(1)
 
-# IMPORTANT: eventlet monkey_patch must be first
-from threading import Lock
 import os
 import ssl
 import json
 import time
 import logging
+import threading
 import certifi
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
-from eventlet.semaphore import Semaphore
 
 
 # =====================================================
@@ -37,16 +41,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-LOG = logging.getLogger("RENDER_MQTT_APP")
+LOG = logging.getLogger("KH01_RENDER")
 
 
 # =====================================================
-# CONFIG (ENVIRONMENT VARIABLES)
+# CONFIGURATION (ENV)
 # =====================================================
-# Required (for real use):
-#   MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, MQTT_TOPIC
-# Optional:
-#   MQTT_TLS (1/0), MQTT_CLIENT_ID, SECRET_KEY, SOCKETIO_CORS
 MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ.get("MQTT_USER", "").strip()
@@ -56,7 +56,6 @@ MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "KH/site-01/#").strip()
 MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip() == "1"
 MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "KH-01-render").strip()
 
-SOCKETIO_CORS = os.environ.get("SOCKETIO_CORS", "*").strip()
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me").strip()
 
 MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
@@ -72,16 +71,15 @@ app.config["SECRET_KEY"] = SECRET_KEY
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins=SOCKETIO_CORS,
-    async_mode="threading"
+    cors_allowed_origins="*",
+    async_mode="threading"   # Python 3.13 safe
 )
-
 
 
 # =====================================================
 # SHARED STATE
 # =====================================================
-state_lock = Lock()
+state_lock = threading.Lock()
 
 LAST_MESSAGE = {
     "ok": False,
@@ -102,7 +100,7 @@ MQTT_STATUS = {
 mqtt_client = None
 
 
-def utc_iso():
+def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -110,7 +108,6 @@ def utc_iso():
 # MQTT CALLBACKS
 # =====================================================
 def on_connect(client, userdata, flags, rc, properties=None):
-    # rc == 0 means success
     LOG.info(f"MQTT on_connect rc={rc}")
 
     with state_lock:
@@ -123,7 +120,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
             client.subscribe(MQTT_TOPIC)
             LOG.info(f"MQTT subscribed: {MQTT_TOPIC}")
         except Exception as e:
-            LOG.exception(f"Subscribe failed: {e}")
+            LOG.exception("Subscribe failed")
             with state_lock:
                 MQTT_STATUS["last_error"] = f"subscribe failed: {e}"
 
@@ -139,7 +136,6 @@ def on_message(client, userdata, msg):
     try:
         raw = msg.payload.decode("utf-8", errors="replace")
 
-        # Try JSON decode; if fails, keep as string
         try:
             parsed = json.loads(raw)
         except Exception:
@@ -156,29 +152,24 @@ def on_message(client, userdata, msg):
             LAST_MESSAGE.clear()
             LAST_MESSAGE.update(payload)
 
-        # Push to browser via websocket
         socketio.emit("mqtt_message", payload)
 
     except Exception as e:
-        LOG.exception(f"on_message error: {e}")
+        LOG.exception("on_message error")
         with state_lock:
             MQTT_STATUS["last_error"] = f"on_message error: {e}"
 
 
 # =====================================================
-# MQTT BUILD + BACKGROUND LOOP
+# MQTT CLIENT BUILDER
 # =====================================================
 def build_mqtt_client() -> mqtt.Client:
-    c = mqtt.Client(
-        client_id=MQTT_CLIENT_ID,
-        protocol=mqtt.MQTTv311
-    )
+    c = mqtt.Client(client_id=MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
 
     if MQTT_USER:
         c.username_pw_set(MQTT_USER, MQTT_PASS)
 
     if MQTT_TLS:
-        # Render-friendly CA bundle (Linux)
         c.tls_set(
             ca_certs=certifi.where(),
             tls_version=ssl.PROTOCOL_TLS_CLIENT
@@ -189,24 +180,22 @@ def build_mqtt_client() -> mqtt.Client:
     c.on_disconnect = on_disconnect
     c.on_message = on_message
 
-    # Better reconnect behavior
     c.reconnect_delay_set(min_delay=MQTT_RECONNECT_MIN, max_delay=MQTT_RECONNECT_MAX)
-
     return c
 
 
+# =====================================================
+# MQTT WORKER
+# =====================================================
 def mqtt_worker():
     """
-    Runs forever in a background green thread.
-    Ensures:
-    - connect
-    - loop_start
-    - reconnect on any exception
+    Runs forever in a background thread.
+    Connects to MQTT, starts network loop, reconnects on failures.
     """
     global mqtt_client
 
     if not MQTT_HOST:
-        LOG.error("MQTT_HOST is empty. Set MQTT_HOST in Render environment variables.")
+        LOG.error("MQTT_HOST is empty. Set MQTT_HOST in Render Environment.")
         with state_lock:
             MQTT_STATUS["last_error"] = "MQTT_HOST not set"
         return
@@ -223,11 +212,9 @@ def mqtt_worker():
 
             mqtt_client.loop_start()
 
-            # Keep worker alive; loop_start runs network loop in background thread
-            # We still watch state periodically.
+            # Keep alive until something breaks
             while True:
-               time.sleep(5)
-
+                time.sleep(5)
 
         except Exception as e:
             LOG.error(f"MQTT worker error: {e}")
@@ -235,7 +222,6 @@ def mqtt_worker():
                 MQTT_STATUS["connected"] = False
                 MQTT_STATUS["last_error"] = str(e)
 
-            # Clean shutdown if possible
             try:
                 if mqtt_client is not None:
                     mqtt_client.loop_stop()
@@ -246,25 +232,26 @@ def mqtt_worker():
             time.sleep(5)
 
 
-
+# Start worker once, safely
 _started = False
+_started_lock = threading.Lock()
 
 
 @app.before_request
-def _start_once():
-    """
-    Start background task once.
-    Using before_request instead of before_first_request (Flask 3 changes).
-    """
+def start_once():
     global _started
-    if not _started:
+    if _started:
+        return
+    with _started_lock:
+        if _started:
+            return
         _started = True
         socketio.start_background_task(mqtt_worker)
         LOG.info("Started MQTT background worker")
 
 
 # =====================================================
-# SIMPLE UI (embedded)
+# SIMPLE UI
 # =====================================================
 INDEX_HTML = """
 <!doctype html>
@@ -282,7 +269,6 @@ INDEX_HTML = """
     .ok { color: #0a7; font-weight:700; }
     .bad { color: #c22; font-weight:700; }
     .small { color:#666; font-size: 13px; }
-    input { padding:8px; width: 320px; }
     button { padding:8px 12px; cursor:pointer; }
   </style>
 </head>
@@ -322,13 +308,8 @@ INDEX_HTML = """
 
     const socket = io();
 
-    socket.on("connect", () => {
-      addLine("socket connected: " + socket.id);
-    });
-
-    socket.on("disconnect", () => {
-      addLine("socket disconnected");
-    });
+    socket.on("connect", () => addLine("socket connected: " + socket.id));
+    socket.on("disconnect", () => addLine("socket disconnected"));
 
     socket.on("mqtt_message", (msg) => {
       lastMetaEl.textContent = `${msg.received_at} | ${msg.topic}`;
@@ -343,6 +324,7 @@ INDEX_HTML = """
     async function refreshStatus() {
       const r = await fetch("/status");
       const data = await r.json();
+
       if (data.mqtt.connected) {
         connEl.textContent = "CONNECTED";
         connEl.className = "ok";
@@ -350,6 +332,7 @@ INDEX_HTML = """
         connEl.textContent = "DISCONNECTED";
         connEl.className = "bad";
       }
+
       connDetailsEl.textContent =
         `topic=${data.mqtt.subscribed_topic} | last_error=${data.mqtt.last_error || "none"}`;
     }
@@ -387,7 +370,7 @@ def status():
 @app.post("/publish")
 def publish():
     """
-    Optional: publish from HTTP for testing.
+    Publish from HTTP for testing.
     Body JSON: {"topic":"...", "payload": {... or "text"}}
     """
     global mqtt_client
@@ -414,7 +397,7 @@ def publish():
 
 
 # =====================================================
-# MAIN
+# MAIN (local only; Render uses gunicorn)
 # =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
