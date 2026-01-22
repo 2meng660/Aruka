@@ -12,11 +12,10 @@ Features:
 - TLS with certifi (works on Render Linux)
 - simple HTML UI embedded (no templates folder needed)
 """
+state_lock = Semaphore(1)
 
 # IMPORTANT: eventlet monkey_patch must be first
-import eventlet
-eventlet.monkey_patch()
-
+from threading import Lock
 import os
 import ssl
 import json
@@ -74,16 +73,15 @@ app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(
     app,
     cors_allowed_origins=SOCKETIO_CORS,
-    async_mode="eventlet",
-    ping_interval=25,
-    ping_timeout=60
+    async_mode="threading"
 )
+
 
 
 # =====================================================
 # SHARED STATE
 # =====================================================
-state_lock = Semaphore(1)
+state_lock = Lock()
 
 LAST_MESSAGE = {
     "ok": False,
@@ -228,7 +226,8 @@ def mqtt_worker():
             # Keep worker alive; loop_start runs network loop in background thread
             # We still watch state periodically.
             while True:
-                eventlet.sleep(5)
+               time.sleep(5)
+
 
         except Exception as e:
             LOG.error(f"MQTT worker error: {e}")
@@ -244,7 +243,8 @@ def mqtt_worker():
             except Exception:
                 pass
 
-            eventlet.sleep(5)
+            time.sleep(5)
+
 
 
 _started = False
