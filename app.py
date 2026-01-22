@@ -3,7 +3,7 @@
 Aruka / KH-01 Industrial Control Dashboard (Single File)
 
 Render Start Command (recommended for stability):
-  gunicorn -w 1 --threads 8 --bind 0.0.0.0:$PORT --timeout 120 app:app
+  gunicorn -w 1 --threads 8 --worker-class gthread --timeout 120 app:app --bind 0.0.0.0:$PORT --log-level info
 
 Render Environment Variables:
   MQTT_HOST=t569f61e.ala.asia-southeast1.emqxsl.com
@@ -11,8 +11,8 @@ Render Environment Variables:
   MQTT_USER=KH-01-device
   MQTT_PASS=Radiation0-Disperser8-Sternum1-Trio4
   MQTT_TLS=1
-  MQTT_TLS_INSECURE=0   # set 1 if you want "insecure" like ESP32
-  MQTT_CLIENT_ID=Aruka_KH   # base id (we auto-suffix to avoid collisions)
+  MQTT_TLS_INSECURE=0
+  MQTT_CLIENT_ID=Aruka_KH
   SECRET_KEY=anystring
 
 Optional (if you want to override topics):
@@ -168,7 +168,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_disconnect(client, userdata, rc, properties=None):
-    # rc != 0 often means network drop / broker closed connection
     LOG.warning(f"MQTT on_disconnect rc={rc}")
     with lock:
         MQTT_STATUS["connected"] = False
@@ -194,7 +193,6 @@ def on_message(client, userdata, msg):
             LAST_BY_TOPIC[msg.topic] = record
             LAST_UPDATE_AT = record["received_at"]
 
-        # push to UI
         socketio.emit("mqtt_message", record)
 
     except Exception as e:
@@ -204,7 +202,7 @@ def on_message(client, userdata, msg):
 
 
 # =====================================================
-# MQTT WORKER (single loop)
+# MQTT WORKER
 # =====================================================
 def build_mqtt_client() -> mqtt.Client:
     c = mqtt.Client(client_id=CLIENT_ID, protocol=mqtt.MQTTv311, clean_session=True)
@@ -245,7 +243,6 @@ def mqtt_worker():
                 f"TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE} client_id={CLIENT_ID}"
             )
 
-            # connect + network loop (paho will auto-reconnect inside loop_forever)
             mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
             mqtt_client.loop_forever(retry_first_connection=True)
 
@@ -282,26 +279,23 @@ def _start_once():
 
 
 # =====================================================
-# UI (Clean Dashboard)
+# UI (Responsive Dashboard)
 # =====================================================
 INDEX_HTML = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>KH-01 Industrial Control</title>
   <style>
     :root{
       --bg0:#070b12;
       --bg1:#0b1220;
-      --card:#0e1729;
-      --card2:#0f1b31;
       --line:rgba(255,255,255,.08);
       --muted:rgba(255,255,255,.65);
       --text:#e9eefc;
       --accent:#36d399;
-      --warn:#f59e0b;
       --danger:#ef4444;
       --blue:#60a5fa;
       --cyan:#22d3ee;
@@ -316,9 +310,20 @@ INDEX_HTML = r"""
       color:var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif;
     }
-    .wrap{max-width:1100px;margin:0 auto;padding:18px 14px 40px;}
+
+    .wrap{
+      max-width:1100px;
+      margin:0 auto;
+      padding:
+        calc(18px + env(safe-area-inset-top))
+        calc(14px + env(safe-area-inset-right))
+        40px
+        calc(14px + env(safe-area-inset-left));
+    }
+
     .topbar{
       display:flex;align-items:center;justify-content:space-between;
+      gap:12px;flex-wrap:wrap;
       padding:14px 16px;border:1px solid var(--line);border-radius:16px;
       background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
       backdrop-filter: blur(8px);
@@ -330,10 +335,12 @@ INDEX_HTML = r"""
       display:flex;align-items:center;justify-content:center;
       box-shadow: 0 10px 30px rgba(34,211,238,.18);
       font-weight:800;color:#08111f;
+      flex:0 0 auto;
     }
     .title h1{margin:0;font-size:18px;letter-spacing:.2px;}
     .title p{margin:2px 0 0;color:var(--muted);font-size:12px;}
-    .statusbar{display:flex;gap:12px;align-items:center;}
+
+    .statusbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
     .pill{
       display:inline-flex;align-items:center;gap:8px;
       padding:8px 12px;border-radius:999px;border:1px solid var(--line);
@@ -344,16 +351,18 @@ INDEX_HTML = r"""
     .dot.ok{background:var(--accent);box-shadow:0 0 0 4px rgba(54,211,153,.12);}
     .dot.bad{background:var(--danger);box-shadow:0 0 0 4px rgba(239,68,68,.12);}
     .small{font-size:12px;color:var(--muted);}
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:14px;}
+
     .section{
-      grid-column: span 12;
+      margin-top:14px;
       border:1px solid var(--line);border-radius:16px;
       background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
       overflow:hidden;
     }
     .sectionHead{
       display:flex;align-items:center;justify-content:space-between;
+      gap:10px;
       padding:12px 14px;border-bottom:1px solid var(--line);
+      flex-wrap:wrap;
     }
     .sectionHead .left{display:flex;gap:10px;align-items:center;}
     .ico{
@@ -361,21 +370,22 @@ INDEX_HTML = r"""
       display:flex;align-items:center;justify-content:center;
       background:rgba(96,165,250,.18);border:1px solid rgba(96,165,250,.25);
       color:#bcd7ff;font-weight:700;
+      flex:0 0 auto;
     }
     .sectionHead h2{margin:0;font-size:14px;letter-spacing:.2px;}
-    .cards{padding:14px;display:grid;gap:12px;}
-    .cards.two{grid-template-columns:repeat(2,1fr);}
-    .cards.three{grid-template-columns:repeat(3,1fr);}
-    .cards.four{grid-template-columns:repeat(4,1fr);}
-    @media(max-width:980px){
-      .cards.four,.cards.three,.cards.two{grid-template-columns:1fr;}
-      .wrap{padding:14px 12px 30px;}
+
+    /* Auto responsive grid (works for laptop + iPhone 12 Pro Max + Android) */
+    .cards{
+      padding:14px;
+      display:grid;
+      gap:12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     }
+
     .card{
       border:1px solid var(--line);border-radius:16px;
       background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01));
       padding:14px;
-      position:relative;
       min-height:92px;
     }
     .card .label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;}
@@ -390,10 +400,14 @@ INDEX_HTML = r"""
       height:3px;border-radius:999px;margin-top:10px;background:rgba(255,255,255,.10);overflow:hidden;
     }
     .accentBar > div{height:100%;width:40%;background:linear-gradient(90deg, var(--accent), var(--cyan));}
+
+    /* Burners: responsive auto-fit */
     .burnerRow{
-      display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:14px;
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap:12px;
+      padding:14px;
     }
-    @media(max-width:980px){.burnerRow{grid-template-columns:1fr;}}
     .burner{
       border:1px solid rgba(239,68,68,.45);
       border-radius:16px;padding:14px;
@@ -413,10 +427,8 @@ INDEX_HTML = r"""
     }
     .badge.off{color:rgba(255,255,255,.65);}
     .badge.on{color:var(--accent);border-color:rgba(54,211,153,.35);}
-    .kv{display:flex;justify-content:space-between;gap:10px;margin-top:10px;color:var(--muted);font-size:12px;}
-    .toolbar{
-      display:flex;gap:10px;align-items:center;
-    }
+
+    .toolbar{display:flex;gap:10px;align-items:center;}
     button{
       cursor:pointer;
       padding:8px 12px;border-radius:12px;
@@ -434,6 +446,18 @@ INDEX_HTML = r"""
       border-top:1px solid var(--line);
     }
     .foot{margin-top:12px;color:var(--muted);font-size:12px;text-align:right;}
+
+    /* Extra mobile tuning */
+    @media (max-width: 480px){
+      .title h1{ font-size: 16px; }
+      .title p{ font-size: 11px; }
+      .pill{ padding: 7px 10px; font-size: 12px; }
+      .sectionHead{ padding: 10px 12px; }
+      .cards, .burnerRow{ padding: 12px; gap: 10px; }
+      .card{ padding: 12px; border-radius: 14px; }
+      .value{ font-size: 28px; }
+      .unit{ font-size: 13px; }
+    }
   </style>
 </head>
 <body>
@@ -459,8 +483,7 @@ INDEX_HTML = r"""
       </div>
     </div>
 
-    <!-- Temperature Monitoring -->
-    <div class="section" style="margin-top:14px;">
+    <div class="section">
       <div class="sectionHead">
         <div class="left">
           <div class="ico">T</div>
@@ -470,22 +493,20 @@ INDEX_HTML = r"""
           <button onclick="refreshAll()">Refresh</button>
         </div>
       </div>
-      <div class="cards two" id="tempCards"></div>
+      <div class="cards" id="tempCards"></div>
     </div>
 
-    <!-- Power Consumption -->
-    <div class="section" style="margin-top:14px;">
+    <div class="section">
       <div class="sectionHead">
         <div class="left">
           <div class="ico">P</div>
           <h2>Power Consumption</h2>
         </div>
       </div>
-      <div class="cards three" id="powerCards"></div>
+      <div class="cards" id="powerCards"></div>
     </div>
 
-    <!-- Burner Status -->
-    <div class="section" style="margin-top:14px;">
+    <div class="section">
       <div class="sectionHead">
         <div class="left">
           <div class="ico">B</div>
@@ -495,19 +516,17 @@ INDEX_HTML = r"""
       <div class="burnerRow" id="burnerRow"></div>
     </div>
 
-    <!-- VFD Frequency Control -->
-    <div class="section" style="margin-top:14px;">
+    <div class="section">
       <div class="sectionHead">
         <div class="left">
           <div class="ico">V</div>
           <h2>VFD Frequency Control</h2>
         </div>
       </div>
-      <div class="cards four" id="vfdCards"></div>
+      <div class="cards" id="vfdCards"></div>
     </div>
 
-    <!-- Debug (optional) -->
-    <div class="section" style="margin-top:14px;">
+    <div class="section">
       <div class="sectionHead">
         <div class="left">
           <div class="ico">D</div>
@@ -522,9 +541,6 @@ INDEX_HTML = r"""
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    // ----------------------------
-    // TOPIC MAP (exact topics)
-    // ----------------------------
     const TOPICS = {
       t1: "KH/site-01/KH-01/temperature_probe1",
       t2: "KH/site-01/KH-01/temperature_probe2",
@@ -541,7 +557,6 @@ INDEX_HTML = r"""
       byTopic: {},
     };
 
-    // UI elements
     const dot = document.getElementById("dot");
     const connText = document.getElementById("connText");
     const lastUpdate = document.getElementById("lastUpdate");
@@ -575,8 +590,6 @@ INDEX_HTML = r"""
       return (x && typeof x === "object") ? x : null;
     }
 
-    // Extract common payload shape you send:
-    // { value: ..., name: "...", unit:"C", timestamp:"..." }
     function getPayload(topic){
       const rec = state.byTopic[topic];
       if(!rec) return null;
@@ -626,7 +639,7 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const unit = val?.unit || obj?.unit || "A";
+      const unit = obj?.unit || "A";
       const ts = obj?.timestamp ?? state.byTopic[TOPICS.pwr]?.received_at ?? "";
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
@@ -657,7 +670,6 @@ INDEX_HTML = r"""
       const ts = obj?.timestamp ?? state.byTopic[TOPICS.sts]?.received_at ?? "";
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
-      // Your status example shows burner1, burner3, burner4, burner6
       const burners = [
         {k:"burner1", name:"Burner #1", sub:"Primary"},
         {k:"burner3", name:"Burner #3", sub:"Secondary"},
@@ -687,27 +699,28 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const unit = val?.unit || obj?.unit || "Hz";
+      const unit = obj?.unit || "Hz";
       const ts = obj?.timestamp ?? state.byTopic[TOPICS.vfd]?.received_at ?? "";
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
+      /* IMPORTANT: match your real JSON keys exactly */
       const keys = [
         ["Bucket", "BUCKET"],
         ["INLETScrew", "INLET SCREW"],
-        ["AirLocker", "AIR LOCKER"],
-        ["exhaust1", "EXHAUST 1"],
-        ["exhaust2", "EXHAUST 2"],
+        ["air locker", "AIR LOCKER"],
+        ["exaust1", "EXHAUST 1"],
+        ["exaust2", "EXHAUST 2"],
         ["outscrew1", "OUTSCREW 1"],
         ["outscrew2", "OUTSCREW 2"],
         ["reactor", "REACTOR"],
-        ["syngas", "SYNGAS"],
+        ["syn gas", "SYNGAS"],
       ];
 
       let html = "";
       for(const [k, label] of keys){
         const v = (val && (k in val)) ? val[k] : "--";
         const num = Number(v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/60)*100)) : 15;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 15;
         html += cardHTML(label, "VFD", v, unit, sub, pct);
       }
       vfdCards.innerHTML = html;
@@ -739,18 +752,13 @@ INDEX_HTML = r"""
       renderAll();
     }
 
-    // Socket.IO
     const socketioClient = io({ path: "/socket.io", transports: ["websocket","polling"] });
 
     socketioClient.on("connect", () => {
-      // connection to server OK; MQTT connection is separate
-      // refresh to get mqtt state
       refreshAll();
     });
 
     socketioClient.on("disconnect", () => {
-      // socket disconnected; keep UI but show disconnected dot
-      // (does not necessarily mean MQTT down)
       setConnected(false);
     });
 
@@ -762,7 +770,6 @@ INDEX_HTML = r"""
       pushDebug(rec);
     });
 
-    // initial
     refreshAll();
     setInterval(refreshAll, 5000);
   </script>
