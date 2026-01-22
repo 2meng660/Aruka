@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: kh01-dashboard
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
