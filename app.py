@@ -45,10 +45,10 @@ def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()
+MQTT_HOST = os.environ.get("MQTT_HOST", "t569f61e.ala.asia-southeast1.emqxsl.com").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
-MQTT_USER = os.environ.get("MQTT_USER", "").strip()
-MQTT_PASS = os.environ.get("MQTT_PASS", "").strip()
+MQTT_USER = os.environ.get("MQTT_USER", "KH-01-device").strip()
+MQTT_PASS = os.environ.get("MQTT_PASS", "Radiation0-Disperser8-Sternum1-Trio4").strip()
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "KH/site-01/KH-01/#").strip()
 
 MQTT_TLS = env_bool("MQTT_TLS", "1")
