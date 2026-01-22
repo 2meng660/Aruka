@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Aruka / KH-01 MQTT Dashboard (Render-ready, single file)
+Aruka / KH-01 MQTT Dashboard (Render-ready, single file, Python 3.13)
 
-Start command on Render:
+Render Start Command:
   gunicorn -w 1 app:app --bind 0.0.0.0:$PORT --log-level info
 
-ENV vars (Render -> Environment):
-  MQTT_HOST   (required)  e.g. t569f61e.ala.asia-southeast1.emqxsl.com
-  MQTT_PORT   (default 8883)
-  MQTT_USER   (optional)
-  MQTT_PASS   (optional)
-  MQTT_TOPIC  (default KH/site-01/KH-01/#)
-  MQTT_TLS    (default 1)   1=tls, 0=plain
-  MQTT_CLIENT_ID (default Aruka_KH_render)
-  SECRET_KEY  (optional)
+Render Environment Variables (IMPORTANT):
+  MQTT_HOST=t569f61e.ala.asia-southeast1.emqxsl.com
+  MQTT_PORT=8883
+  MQTT_USER=KH-01-device
+  MQTT_PASS=Radiation0-Disperser8-Sternum1-Trio4
+  MQTT_TLS=1
+  MQTT_TLS_INSECURE=1   (optional; set 1 if you want insecure like ESP32)
+  MQTT_TOPIC=KH/site-01/KH-01/#
+  MQTT_CLIENT_ID=Aruka_KH_render (optional)
+  SECRET_KEY=anystring (optional)
 """
 
 import os
@@ -29,28 +30,37 @@ from flask import Flask, jsonify, request, render_template_string
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
 
+
 # =====================================================
 # LOGGING
 # =====================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOG = logging.getLogger("ARUKA_RENDER")
 
+
 # =====================================================
 # ENV CONFIG
 # =====================================================
+def env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ.get("MQTT_USER", "").strip()
 MQTT_PASS = os.environ.get("MQTT_PASS", "").strip()
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "KH/site-01/KH-01/#").strip()
 
-MQTT_TLS = os.environ.get("MQTT_TLS", "1").strip() == "1"
+MQTT_TLS = env_bool("MQTT_TLS", "1")
+MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")  # set 1 to behave like ESP32 insecure
 MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "Aruka_KH_render").strip()
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me").strip()
+
 MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
 MQTT_RECONNECT_MIN = int(os.environ.get("MQTT_RECONNECT_MIN", "1"))
 MQTT_RECONNECT_MAX = int(os.environ.get("MQTT_RECONNECT_MAX", "30"))
+
 
 # =====================================================
 # FLASK / SOCKETIO
@@ -61,11 +71,12 @@ app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",  # Python 3.13 safe on Render
-    path="socket.io",
+    async_mode="threading",     # Python 3.13 safe
+    path="socket.io",           # must match client
     ping_interval=25,
     ping_timeout=60,
 )
+
 
 # =====================================================
 # SHARED STATE
@@ -78,8 +89,13 @@ MQTT_STATUS = {
     "last_connect_at": None,
     "last_disconnect_at": None,
     "last_error": None,
+    "host": MQTT_HOST,
+    "port": MQTT_PORT,
+    "tls": MQTT_TLS,
+    "tls_insecure": MQTT_TLS_INSECURE,
 }
 
+LAST_BY_TOPIC = {}  # {topic: {"topic":..., "payload":..., "received_at":...}}
 LAST_MESSAGE = {
     "ok": False,
     "topic": None,
@@ -145,6 +161,13 @@ def on_message(client, userdata, msg):
         with state_lock:
             LAST_MESSAGE.clear()
             LAST_MESSAGE.update(payload)
+            LAST_BY_TOPIC[msg.topic] = payload
+            # keep memory small
+            if len(LAST_BY_TOPIC) > 200:
+                # remove oldest by received_at (simple)
+                oldest = sorted(LAST_BY_TOPIC.items(), key=lambda kv: kv[1].get("received_at", ""))[:50]
+                for k, _ in oldest:
+                    LAST_BY_TOPIC.pop(k, None)
 
         socketio.emit("mqtt_message", payload)
 
@@ -168,9 +191,7 @@ def build_mqtt_client() -> mqtt.Client:
             ca_certs=certifi.where(),
             tls_version=ssl.PROTOCOL_TLS_CLIENT,
         )
-        # For EMQX Cloud you should keep this False if possible.
-        # Only set True if you know you need insecure.
-        c.tls_insecure_set(False)
+        c.tls_insecure_set(MQTT_TLS_INSECURE)
 
     c.on_connect = on_connect
     c.on_disconnect = on_disconnect
@@ -196,7 +217,7 @@ def mqtt_worker():
 
             mqtt_client = build_mqtt_client()
 
-            LOG.info(f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} TLS={MQTT_TLS}")
+            LOG.info(f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE}")
             mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
             mqtt_client.loop_start()
 
@@ -219,6 +240,7 @@ def mqtt_worker():
             time.sleep(5)
 
 
+# start worker only once
 _started = False
 _started_lock = threading.Lock()
 
@@ -321,7 +343,7 @@ INDEX_HTML = """
       }
 
       connDetailsEl.textContent =
-        `topic=${data.mqtt.subscribed_topic} | last_error=${data.mqtt.last_error || "none"}`;
+        `host=${data.mqtt.host || "?"}:${data.mqtt.port} | tls=${data.mqtt.tls} insecure=${data.mqtt.tls_insecure} | topic=${data.mqtt.subscribed_topic} | last_error=${data.mqtt.last_error || "none"}`;
     }
 
     refreshStatus();
@@ -348,13 +370,26 @@ def health():
 @app.get("/status")
 def status():
     with state_lock:
-        return jsonify({"mqtt": MQTT_STATUS, "last_message": LAST_MESSAGE})
+        return jsonify({
+            "mqtt": MQTT_STATUS,
+            "last_message": LAST_MESSAGE,
+            "topics_count": len(LAST_BY_TOPIC),
+        })
+
+
+@app.get("/topics")
+def topics():
+    """Return last value for each topic (useful for debugging)."""
+    with state_lock:
+        # return a copy (avoid race)
+        data = dict(LAST_BY_TOPIC)
+    return jsonify({"ok": True, "topics": data})
 
 
 @app.post("/publish")
 def publish():
     """
-    Publish a message for testing.
+    Publish from HTTP for testing.
     JSON: {"topic":"KH/site-01/KH-01/status", "payload": {... or "text"}}
     """
     global mqtt_client
@@ -386,3 +421,4 @@ def publish():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     socketio.run(app, host="0.0.0.0", port=port)
+MQTT_PASS
