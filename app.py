@@ -2,19 +2,22 @@
 """
 Aruka / KH-01 MQTT Dashboard (Render-ready, single file, Python 3.13)
 
-Render Start Command:
+RENDER START COMMAND:
   gunicorn -w 1 app:app --bind 0.0.0.0:$PORT --log-level info
 
-Render Environment Variables (IMPORTANT):
+RENDER ENVIRONMENT VARIABLES (set these in Render Dashboard -> Environment):
   MQTT_HOST=t569f61e.ala.asia-southeast1.emqxsl.com
   MQTT_PORT=8883
   MQTT_USER=KH-01-device
   MQTT_PASS=Radiation0-Disperser8-Sternum1-Trio4
   MQTT_TLS=1
-  MQTT_TLS_INSECURE=1   (optional; set 1 if you want insecure like ESP32)
+  MQTT_TLS_INSECURE=1      # optional (1 = insecure like ESP32), else 0
   MQTT_TOPIC=KH/site-01/KH-01/#
-  MQTT_CLIENT_ID=Aruka_KH_render (optional)
-  SECRET_KEY=anystring (optional)
+
+OPTIONAL:
+  MQTT_CLIENT_ID=Aruka_KH_render
+  SECRET_KEY=anystring
+  UI_TITLE=Aruka KH-01 MQTT Dashboard
 """
 
 import os
@@ -39,12 +42,33 @@ LOG = logging.getLogger("ARUKA_RENDER")
 
 
 # =====================================================
-# ENV CONFIG
+# HELPERS
 # =====================================================
 def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_json_loads(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
+
+
+def topic_tail(topic: str) -> str:
+    # For nicer UI label: show last part
+    if not topic:
+        return ""
+    return topic.split("/")[-1]
+
+
+# =====================================================
+# ENV CONFIG
+# =====================================================
 MQTT_HOST = os.environ.get("MQTT_HOST", "t569f61e.ala.asia-southeast1.emqxsl.com").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ.get("MQTT_USER", "KH-01-device").strip()
@@ -52,10 +76,11 @@ MQTT_PASS = os.environ.get("MQTT_PASS", "Radiation0-Disperser8-Sternum1-Trio4").
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "KH/site-01/KH-01/#").strip()
 
 MQTT_TLS = env_bool("MQTT_TLS", "1")
-MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")  # set 1 to behave like ESP32 insecure
+MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")  # 1 behaves like ESP32 insecure
 MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "Aruka_KH_render").strip()
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me").strip()
+UI_TITLE = os.environ.get("UI_TITLE", "Aruka KH-01 MQTT Dashboard").strip()
 
 MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
 MQTT_RECONNECT_MIN = int(os.environ.get("MQTT_RECONNECT_MIN", "1"))
@@ -68,11 +93,12 @@ MQTT_RECONNECT_MAX = int(os.environ.get("MQTT_RECONNECT_MAX", "30"))
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 
+# Python 3.13 safe. This will use polling (not websocket) under gunicorn sync workers.
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",     # Python 3.13 safe
-    path="socket.io",           # must match client
+    async_mode="threading",
+    path="socket.io",
     ping_interval=25,
     ping_timeout=60,
 )
@@ -95,7 +121,7 @@ MQTT_STATUS = {
     "tls_insecure": MQTT_TLS_INSECURE,
 }
 
-LAST_BY_TOPIC = {}  # {topic: {"topic":..., "payload":..., "received_at":...}}
+# Last message overall
 LAST_MESSAGE = {
     "ok": False,
     "topic": None,
@@ -104,18 +130,10 @@ LAST_MESSAGE = {
     "note": "No data yet",
 }
 
+# Last message per topic
+LAST_BY_TOPIC = {}  # {topic: payload_dict}
+
 mqtt_client = None
-
-
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_json_loads(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return s
 
 
 # =====================================================
@@ -131,7 +149,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
     if rc == 0:
         try:
-            client.subscribe(MQTT_TOPIC)
+            client.subscribe(MQTT_TOPIC, qos=0)
             LOG.info(f"MQTT subscribed: {MQTT_TOPIC}")
         except Exception as e:
             LOG.exception("Subscribe failed")
@@ -154,6 +172,8 @@ def on_message(client, userdata, msg):
         payload = {
             "ok": True,
             "topic": msg.topic,
+            "qos": int(getattr(msg, "qos", 0)),
+            "retain": bool(getattr(msg, "retain", False)),
             "payload": parsed,
             "received_at": utc_iso(),
         }
@@ -162,13 +182,18 @@ def on_message(client, userdata, msg):
             LAST_MESSAGE.clear()
             LAST_MESSAGE.update(payload)
             LAST_BY_TOPIC[msg.topic] = payload
-            # keep memory small
-            if len(LAST_BY_TOPIC) > 200:
-                # remove oldest by received_at (simple)
-                oldest = sorted(LAST_BY_TOPIC.items(), key=lambda kv: kv[1].get("received_at", ""))[:50]
+
+            # keep memory bounded
+            if len(LAST_BY_TOPIC) > 500:
+                # remove ~100 oldest by received_at
+                oldest = sorted(
+                    LAST_BY_TOPIC.items(),
+                    key=lambda kv: kv[1].get("received_at", "")
+                )[:100]
                 for k, _ in oldest:
                     LAST_BY_TOPIC.pop(k, None)
 
+        # push to UI
         socketio.emit("mqtt_message", payload)
 
     except Exception as e:
@@ -217,7 +242,10 @@ def mqtt_worker():
 
             mqtt_client = build_mqtt_client()
 
-            LOG.info(f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE}")
+            LOG.info(
+                f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} "
+                f"TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE} topic={MQTT_TOPIC}"
+            )
             mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
             mqtt_client.loop_start()
 
@@ -267,67 +295,252 @@ INDEX_HTML = """
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Aruka KH-01 Dashboard</title>
+  <title>{{title}}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 18px; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:12px; min-width:320px; }
-    .title { font-weight:700; margin-bottom:8px; }
-    pre { background:#f7f7f7; padding:10px; border-radius:8px; overflow:auto; max-height:360px; }
-    .ok { color: #0a7; font-weight:700; }
-    .bad { color: #c22; font-weight:700; }
-    .small { color:#666; font-size: 13px; }
-    button { padding:8px 12px; cursor:pointer; }
+    :root{
+      --bg:#0b0f17;
+      --panel:#111827;
+      --panel2:#0f172a;
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --border:#1f2937;
+      --accent:#a3e635; /* green like your screenshot */
+      --bad:#ef4444;
+      --ok:#22c55e;
+      --shadow: 0 12px 40px rgba(0,0,0,.35);
+      --radius: 18px;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      background: radial-gradient(1200px 700px at 10% 10%, rgba(163,230,53,.10), transparent 50%),
+                  radial-gradient(900px 600px at 90% 30%, rgba(59,130,246,.10), transparent 45%),
+                  var(--bg);
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .wrap{ max-width:1200px; margin:28px auto; padding:0 16px; }
+    h1{ margin:0 0 14px 0; font-size:28px; letter-spacing:.2px; }
+    .toprow{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:16px;
+      margin-bottom:16px;
+    }
+    @media (max-width: 900px){
+      .toprow{ grid-template-columns:1fr; }
+    }
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding:16px;
+    }
+    .title{ font-weight:800; margin-bottom:10px; font-size:16px; }
+    .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:10px 14px;
+      border-radius: 999px;
+      background: rgba(163,230,53,.12);
+      color: var(--accent);
+      font-weight:700;
+      border:1px solid rgba(163,230,53,.25);
+    }
+    .pill.gray{
+      background: rgba(148,163,184,.10);
+      border:1px solid rgba(148,163,184,.20);
+      color: #cbd5e1;
+      font-weight:600;
+    }
+    .status{
+      font-weight:900;
+      letter-spacing:.3px;
+    }
+    .status.ok{ color: var(--ok); }
+    .status.bad{ color: var(--bad); }
+    .muted{ color: var(--muted); font-size:13px; line-height:1.4; }
+    button{
+      background: rgba(255,255,255,.06);
+      border:1px solid var(--border);
+      color: var(--text);
+      padding:10px 14px;
+      border-radius: 12px;
+      cursor:pointer;
+      font-weight:700;
+    }
+    button:hover{ background: rgba(255,255,255,.10); }
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:16px;
+      margin-top:16px;
+    }
+    @media (max-width: 900px){
+      .grid{ grid-template-columns:1fr; }
+    }
+    .topic-card{
+      background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
+      border:1px solid var(--border);
+      border-radius: 26px;
+      box-shadow: var(--shadow);
+      padding:18px;
+      position:relative;
+      overflow:hidden;
+      min-height: 140px;
+    }
+    .topic-card:before{
+      content:"";
+      position:absolute;
+      inset:-80px;
+      background: radial-gradient(260px 180px at 20% 30%, rgba(163,230,53,.10), transparent 70%),
+                  radial-gradient(260px 180px at 80% 40%, rgba(59,130,246,.10), transparent 70%);
+      pointer-events:none;
+    }
+    .topic-card > *{ position:relative; }
+    pre{
+      margin:0;
+      padding:14px;
+      border-radius: 16px;
+      background: rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.06);
+      color: #e5e7eb;
+      overflow:auto;
+      max-height: 180px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .cardhead{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      margin-top:14px;
+      flex-wrap:wrap;
+    }
+    .topicname{ font-weight:900; font-size:18px; }
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      padding:10px 16px;
+      border-radius:999px;
+      background: rgba(163,230,53,.90);
+      color:#0b0f17;
+      font-weight:900;
+      letter-spacing:.2px;
+      white-space:nowrap;
+    }
+    .badge.qos{
+      background: rgba(163,230,53,.90);
+      min-width: 82px;
+    }
+    .toolbar{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-top:10px;
+    }
+    .input{
+      flex:1;
+      min-width: 240px;
+      background: rgba(255,255,255,.06);
+      border:1px solid var(--border);
+      border-radius: 12px;
+      padding:10px 12px;
+      color: var(--text);
+      outline:none;
+    }
+    .input::placeholder{ color: rgba(229,231,235,.55); }
+    .split{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      flex-wrap:wrap;
+    }
   </style>
 </head>
 <body>
-  <h2>Aruka KH-01 MQTT Dashboard</h2>
+  <div class="wrap">
+    <h1>{{title}}</h1>
 
-  <div class="row">
-    <div class="card">
-      <div class="title">MQTT Connection</div>
-      <div>Status: <span id="conn" class="bad">Unknown</span></div>
-      <div class="small" id="connDetails"></div>
-      <div style="margin-top:10px;">
-        <button onclick="refreshStatus()">Refresh</button>
+    <div class="toprow">
+      <div class="card">
+        <div class="title">MQTT Connection</div>
+        <div class="split">
+          <div class="row">
+            <div>Status: <span id="conn" class="status bad">DISCONNECTED</span></div>
+          </div>
+          <button onclick="refreshAll()">Refresh</button>
+        </div>
+        <div class="muted" id="connDetails" style="margin-top:10px;"></div>
+
+        <div class="toolbar">
+          <input id="filter" class="input" placeholder="Filter topics (example: temperature, status, vfd)..." oninput="renderCards()"/>
+          <button onclick="toggleSort()">Sort: <span id="sortMode">Latest</span></button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="title">Last MQTT Message</div>
+        <div class="muted" id="lastMeta">No data</div>
+        <pre id="lastPayload">{}</pre>
       </div>
     </div>
 
     <div class="card">
-      <div class="title">Last MQTT Message</div>
-      <div class="small" id="lastMeta">No data</div>
-      <pre id="lastPayload">{}</pre>
+      <div class="title">Topics (Last value per topic)</div>
+      <div class="muted" id="topicsInfo">Loading...</div>
+      <div class="grid" id="cards"></div>
     </div>
-  </div>
-
-  <div class="card" style="margin-top:12px;">
-    <div class="title">Live Stream</div>
-    <div class="small">Socket.IO event: <b>mqtt_message</b></div>
-    <pre id="stream"></pre>
   </div>
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    const streamEl = document.getElementById("stream");
-    const lastPayloadEl = document.getElementById("lastPayload");
-    const lastMetaEl = document.getElementById("lastMeta");
     const connEl = document.getElementById("conn");
     const connDetailsEl = document.getElementById("connDetails");
+    const lastMetaEl = document.getElementById("lastMeta");
+    const lastPayloadEl = document.getElementById("lastPayload");
+    const cardsEl = document.getElementById("cards");
+    const topicsInfoEl = document.getElementById("topicsInfo");
+    const filterEl = document.getElementById("filter");
+    const sortModeEl = document.getElementById("sortMode");
 
-    // IMPORTANT: match server path
-    const socket = io({ path: "/socket.io" });
+    let topicsMap = {};     // topic -> payload object
+    let sortMode = "latest"; // "latest" or "name"
 
-    socket.on("connect", () => addLine("socket connected: " + socket.id));
-    socket.on("disconnect", () => addLine("socket disconnected"));
-
-    socket.on("mqtt_message", (msg) => {
-      lastMetaEl.textContent = `${msg.received_at} | ${msg.topic}`;
-      lastPayloadEl.textContent = JSON.stringify(msg.payload, null, 2);
-      addLine(JSON.stringify(msg, null, 2));
+    // IMPORTANT: Force polling to avoid websocket session errors on threading mode
+    const socket = io({
+      path: "/socket.io",
+      transports: ["polling"]
     });
 
-    function addLine(s) {
-      streamEl.textContent = (s + "\\n\\n" + streamEl.textContent).slice(0, 12000);
+    socket.on("connect", () => {
+      // ok
+    });
+
+    socket.on("mqtt_message", (msg) => {
+      // Update last overall
+      lastMetaEl.textContent = `${msg.received_at} | ${msg.topic}`;
+      lastPayloadEl.textContent = formatPayload(msg.payload);
+
+      // Update the per-topic map
+      topicsMap[msg.topic] = msg;
+      renderCards();
+    });
+
+    function formatPayload(p) {
+      try {
+        if (typeof p === "string") return p;
+        return JSON.stringify(p, null, 2);
+      } catch(e) {
+        return String(p);
+      }
     }
 
     async function refreshStatus() {
@@ -336,18 +549,94 @@ INDEX_HTML = """
 
       if (data.mqtt.connected) {
         connEl.textContent = "CONNECTED";
-        connEl.className = "ok";
+        connEl.className = "status ok";
       } else {
         connEl.textContent = "DISCONNECTED";
-        connEl.className = "bad";
+        connEl.className = "status bad";
       }
 
       connDetailsEl.textContent =
         `host=${data.mqtt.host || "?"}:${data.mqtt.port} | tls=${data.mqtt.tls} insecure=${data.mqtt.tls_insecure} | topic=${data.mqtt.subscribed_topic} | last_error=${data.mqtt.last_error || "none"}`;
     }
 
-    refreshStatus();
+    async function refreshTopics() {
+      const r = await fetch("/topics");
+      const data = await r.json();
+      if (data.ok && data.topics) {
+        topicsMap = data.topics;
+        renderCards();
+      }
+    }
+
+    async function refreshAll() {
+      await refreshStatus();
+      await refreshTopics();
+    }
+
+    function toggleSort(){
+      sortMode = (sortMode === "latest") ? "name" : "latest";
+      sortModeEl.textContent = (sortMode === "latest") ? "Latest" : "Name";
+      renderCards();
+    }
+
+    function renderCards() {
+      const filter = (filterEl.value || "").toLowerCase().trim();
+
+      // topicsMap may be {topic: msg} OR {topic: payload} depending on endpoint
+      let items = Object.entries(topicsMap).map(([topic, obj]) => {
+        // if endpoint returns msg object already
+        const msg = obj && obj.topic ? obj : { topic, payload: obj.payload ?? obj, received_at: obj.received_at ?? null, qos: obj.qos ?? 0 };
+        return msg;
+      });
+
+      if (filter) {
+        items = items.filter(m =>
+          (m.topic || "").toLowerCase().includes(filter) ||
+          JSON.stringify(m.payload || "").toLowerCase().includes(filter)
+        );
+      }
+
+      if (sortMode === "name") {
+        items.sort((a,b) => (a.topic||"").localeCompare(b.topic||""));
+      } else {
+        // latest first
+        items.sort((a,b) => (b.received_at||"").localeCompare(a.received_at||""));
+      }
+
+      topicsInfoEl.textContent = `Showing ${items.length} topic(s).`;
+
+      cardsEl.innerHTML = items.map(m => {
+        const payloadText = formatPayload(m.payload);
+        const qos = (m.qos === undefined || m.qos === null) ? 0 : m.qos;
+
+        return `
+          <div class="topic-card">
+            <pre>${escapeHtml(payloadText)}</pre>
+            <div class="cardhead">
+              <div class="badge">${escapeHtml(m.topic || "")}</div>
+              <div class="badge qos">QoS ${qos}</div>
+            </div>
+            <div class="muted" style="margin-top:10px;">
+              ${escapeHtml(m.received_at || "")}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function escapeHtml(s){
+      return String(s)
+        .replaceAll("&","&amp;")
+        .replaceAll("<","&lt;")
+        .replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;")
+        .replaceAll("'","&#039;");
+    }
+
+    // Initial load + refresh loops
+    refreshAll();
     setInterval(refreshStatus, 5000);
+    setInterval(refreshTopics, 6000);
   </script>
 </body>
 </html>
@@ -359,7 +648,7 @@ INDEX_HTML = """
 # =====================================================
 @app.get("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(INDEX_HTML, title=UI_TITLE)
 
 
 @app.get("/health")
@@ -379,9 +668,8 @@ def status():
 
 @app.get("/topics")
 def topics():
-    """Return last value for each topic (useful for debugging)."""
+    """Return last value for each topic."""
     with state_lock:
-        # return a copy (avoid race)
         data = dict(LAST_BY_TOPIC)
     return jsonify({"ok": True, "topics": data})
 
@@ -409,7 +697,7 @@ def publish():
         else:
             payload_out = "" if payload is None else str(payload)
 
-        mqtt_client.publish(topic, payload_out)
+        mqtt_client.publish(topic, payload_out, qos=0, retain=False)
         return jsonify({"ok": True, "topic": topic})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -421,4 +709,3 @@ def publish():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     socketio.run(app, host="0.0.0.0", port=port)
-MQTT_PASS
