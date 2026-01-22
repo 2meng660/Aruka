@@ -656,7 +656,7 @@ INDEX_HTML = r"""
       let html = "";
       for(const d of defs){
         const num = Number(d.v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/40)*100)) : 20;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 20;
         html += cardHTML(d.title, "Current", d.v, unit, sub, pct);
       }
       powerCards.innerHTML = html;
