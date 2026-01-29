@@ -2,21 +2,26 @@
 """
 Aruka / KH-01 Industrial Control Dashboard (Single File)
 
-Render Start Command (recommended for stability):
+✅ BEST FIX (Time):
+- Cards show time from MQTT payload: payload.timestamp
+- Top bar also uses the same MQTT timestamp (latest message)
+- Server keeps Cambodia time too (received_at) for debug
+- Optional workaround if your device sends Cambodia time but wrongly ends with "Z"
+  -> set ENV: MQTT_TS_Z_IS_LOCAL=1
+
+Render Start Command:
   gunicorn -w 1 --threads 8 --worker-class gthread --timeout 120 app:app --bind 0.0.0.0:$PORT --log-level info
 
-Render Environment Variables:
-  MQTT_HOST=t569f61e.ala.asia-southeast1.emqxsl.com
+ENV:
+  MQTT_HOST=...
   MQTT_PORT=8883
-  MQTT_USER=KH-01-device
+  MQTT_USER=...
   MQTT_PASS=...
   MQTT_TLS=1
   MQTT_TLS_INSECURE=0
   MQTT_CLIENT_ID=Aruka_KH
   SECRET_KEY=anystring
-
-Optional (override topics):
-  MQTT_TOPICS=KH/site-01/KH-01/temperature_probe1,KH/site-01/KH-01/temperature_probe2,...
+  MQTT_TS_Z_IS_LOCAL=0   (set 1 only if your device time is Cambodia but timestamp ends with Z)
 """
 
 import os
@@ -35,13 +40,11 @@ from flask import Flask, jsonify, render_template_string
 from flask_socketio import SocketIO
 import paho.mqtt.client as mqtt
 
-
 # =====================================================
 # LOGGING
 # =====================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOG = logging.getLogger("KH01")
-
 
 # =====================================================
 # HELPERS
@@ -49,14 +52,11 @@ LOG = logging.getLogger("KH01")
 def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
-
 KH_TZ = ZoneInfo("Asia/Phnom_Penh")
 
-
 def kh_iso() -> str:
-    # Store timestamps already in Cambodia timezone so top bar == cards
+    # Server Cambodia time (used for received_at)
     return datetime.now(KH_TZ).isoformat(timespec="seconds")
-
 
 def safe_json_loads(s: str) -> Any:
     try:
@@ -64,10 +64,32 @@ def safe_json_loads(s: str) -> Any:
     except Exception:
         return s
 
-
 def norm_topic(s: str) -> str:
     return (s or "").strip()
 
+def normalize_mqtt_timestamp(ts: Any) -> Optional[str]:
+    """
+    Return a clean ISO string or None.
+
+    If MQTT_TS_Z_IS_LOCAL=1:
+      - treat "....Z" as local +07:00 (device sends Cambodia time but wrongly marks Z)
+    """
+    if not ts:
+        return None
+    if not isinstance(ts, str):
+        try:
+            ts = str(ts)
+        except Exception:
+            return None
+
+    ts = ts.strip()
+    if not ts:
+        return None
+
+    z_is_local = env_bool("MQTT_TS_Z_IS_LOCAL", "0")
+    if z_is_local and ts.endswith("Z"):
+        ts = ts[:-1] + "+07:00"
+    return ts
 
 # =====================================================
 # CONFIG
@@ -75,7 +97,7 @@ def norm_topic(s: str) -> str:
 MQTT_HOST = os.environ.get("MQTT_HOST", "t569f61e.ala.asia-southeast1.emqxsl.com").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ.get("MQTT_USER", "KH-01-device").strip()
-MQTT_PASS = os.environ.get("MQTT_PASS", "Radiation0-Disperser8-Sternum1-Trio4").strip()
+MQTT_PASS = os.environ.get("MQTT_PASS", "").strip()
 
 MQTT_TLS = env_bool("MQTT_TLS", "1")
 MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")
@@ -106,7 +128,6 @@ else:
 HOSTNAME = socket.gethostname()
 CLIENT_ID = f"{BASE_CLIENT_ID}_{HOSTNAME}_{os.getpid()}"
 
-
 # =====================================================
 # FLASK / SOCKETIO
 # =====================================================
@@ -121,7 +142,6 @@ socketio = SocketIO(
     ping_interval=25,
     ping_timeout=60,
 )
-
 
 # =====================================================
 # SHARED STATE
@@ -141,11 +161,10 @@ MQTT_STATUS: Dict[str, Any] = {
     "last_error": None,
 }
 
-LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
-LAST_UPDATE_AT: Optional[str] = None
+LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}  # topic -> record
+LAST_UPDATE_AT: Optional[str] = None           # ✅ MQTT timestamp (latest), fallback received_at
 
 mqtt_client: Optional[mqtt.Client] = None
-
 
 # =====================================================
 # MQTT CALLBACKS
@@ -169,7 +188,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
                     MQTT_STATUS["last_error"] = f"subscribe failed: {e}"
         LOG.info(f"Subscribed to {ok}/{len(MQTT_TOPICS)} topics")
 
-
 def on_disconnect(client, userdata, rc, properties=None):
     LOG.warning(f"MQTT on_disconnect rc={rc}")
     with lock:
@@ -178,23 +196,28 @@ def on_disconnect(client, userdata, rc, properties=None):
         if rc != 0:
             MQTT_STATUS["last_error"] = f"disconnect rc={rc}"
 
-
 def on_message(client, userdata, msg):
     global LAST_UPDATE_AT
     try:
         raw = msg.payload.decode("utf-8", errors="replace")
         parsed = safe_json_loads(raw)
 
+        mqtt_ts = None
+        if isinstance(parsed, dict):
+            mqtt_ts = normalize_mqtt_timestamp(parsed.get("timestamp"))
+
         record = {
             "topic": msg.topic,
             "payload": parsed,
-            "received_at": kh_iso(),  # ✅ Cambodia time
+            "received_at": kh_iso(),   # server Cambodia time
+            "mqtt_ts": mqtt_ts,        # ✅ from MQTT payload
             "qos": int(getattr(msg, "qos", 0)),
         }
 
         with lock:
             LAST_BY_TOPIC[msg.topic] = record
-            LAST_UPDATE_AT = record["received_at"]
+            # ✅ top bar uses MQTT time (same as cards)
+            LAST_UPDATE_AT = mqtt_ts or record["received_at"]
 
         socketio.emit("mqtt_message", record)
 
@@ -202,7 +225,6 @@ def on_message(client, userdata, msg):
         LOG.exception("on_message error")
         with lock:
             MQTT_STATUS["last_error"] = f"on_message error: {e}"
-
 
 # =====================================================
 # MQTT WORKER
@@ -226,7 +248,6 @@ def build_mqtt_client() -> mqtt.Client:
     c.on_disconnect = on_disconnect
     c.on_message = on_message
     return c
-
 
 def mqtt_worker():
     global mqtt_client
@@ -261,10 +282,8 @@ def mqtt_worker():
 
             time.sleep(3)
 
-
 _started = False
 _started_lock = threading.Lock()
-
 
 @app.before_request
 def _start_once():
@@ -277,7 +296,6 @@ def _start_once():
         _started = True
         socketio.start_background_task(mqtt_worker)
         LOG.info("Started MQTT background worker")
-
 
 # =====================================================
 # UI (Responsive Dashboard)
@@ -311,7 +329,6 @@ INDEX_HTML = r"""
       color:var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif;
     }
-
     .wrap{
       max-width:1100px;
       margin:0 auto;
@@ -321,7 +338,6 @@ INDEX_HTML = r"""
         40px
         calc(14px + env(safe-area-inset-left));
     }
-
     .topbar{
       display:flex;align-items:center;justify-content:space-between;
       gap:12px;flex-wrap:wrap;
@@ -381,7 +397,6 @@ INDEX_HTML = r"""
       gap:12px;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     }
-
     .card{
       border:1px solid var(--line);border-radius:16px;
       background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01));
@@ -539,8 +554,6 @@ INDEX_HTML = r"""
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    const TZ = "Asia/Phnom_Penh";
-
     const TOPICS = {
       t1: "KH/site-01/KH-01/temperature_probe1",
       t2: "KH/site-01/KH-01/temperature_probe2",
@@ -553,7 +566,7 @@ INDEX_HTML = r"""
 
     const state = {
       connected: false,
-      lastUpdate: null, // ALWAYS server time (received_at / last_update_at)
+      lastUpdate: null, // ✅ MQTT timestamp of latest message
       byTopic: {},
     };
 
@@ -578,23 +591,19 @@ INDEX_HTML = r"""
       }
     }
 
-    // ✅ single, stable formatter (server ISO -> Phnom Penh time)
+    // ✅ Format any ISO string to Cambodia time for display
     function fmtTime(iso){
       if(!iso) return "--:--:--";
-
-      const d = new Date(iso); // parses ISO + Z correctly
-
+      const d = new Date(iso);
       if (isNaN(d.getTime())) return "--:--:--";
-
       return new Intl.DateTimeFormat("en-GB", {
-        timeZone: "Asia/Phnom_Penh",   // convert UTC → Cambodia
+        timeZone: "Asia/Phnom_Penh",
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
         hour12: true
       }).format(d);
     }
-
 
     function safeObj(x){
       return (x && typeof x === "object") ? x : null;
@@ -609,10 +618,12 @@ INDEX_HTML = r"""
       return rec ? rec.payload : null;
     }
 
-    // ✅ always prefer server receive time (rec.received_at)
-    function getServerTs(topic){
+    // ✅ Always take MQTT timestamp from record.mqtt_ts (already normalized by server)
+    function getMqttTs(topic){
       const rec = getRec(topic);
-      return rec?.received_at || "";
+      const p = rec?.payload;
+      const mqttTs = (p && typeof p === "object") ? p.timestamp : null;
+      return mqttTs || rec?.mqtt_ts || "";
     }
 
     function cardHTML(label, tag, value, unit, sub, barPct){
@@ -640,13 +651,11 @@ INDEX_HTML = r"""
 
       let html = "";
       for(const d of defs){
-        const p = getPayload(d.topic);
-        const obj = safeObj(p);
+        const obj = safeObj(getPayload(d.topic));
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
 
-        const ts = obj?.timestamp;
-
+        const ts = getMqttTs(d.topic);
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
@@ -657,13 +666,11 @@ INDEX_HTML = r"""
     }
 
     function renderPower(){
-      const p = getPayload(TOPICS.pwr);
-      const obj = safeObj(p);
+      const obj = safeObj(getPayload(TOPICS.pwr));
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = obj?.timestamp;
-
+      const ts = getMqttTs(TOPICS.pwr);
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -686,12 +693,10 @@ INDEX_HTML = r"""
     }
 
     function renderBurners(){
-      const p = getPayload(TOPICS.sts);
-      const obj = safeObj(p);
+      const obj = safeObj(getPayload(TOPICS.sts));
       const val = safeObj(obj?.value);
 
-      const ts = obj?.timestamp;
-
+      const ts = getMqttTs(TOPICS.sts);
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
       const burners = [
@@ -719,13 +724,11 @@ INDEX_HTML = r"""
     }
 
     function renderVFD(){
-      const p = getPayload(TOPICS.vfd);
-      const obj = safeObj(p);
+      const obj = safeObj(getPayload(TOPICS.vfd));
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = obj?.timestamp;
-
+      const ts = getMqttTs(TOPICS.vfd);
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const keys = [
@@ -756,7 +759,6 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
-      // ✅ top bar also uses server time, formatted to Phnom Penh
       if(state.lastUpdate){
         lastUpdate.textContent = fmtTime(state.lastUpdate);
       } else {
@@ -774,7 +776,8 @@ INDEX_HTML = r"""
       const data = await r.json();
       setConnected(!!data.mqtt.connected);
 
-      state.lastUpdate = data.last_update_at;     // server UTC ISO
+      // ✅ last_update_at is already mqtt timestamp (best)
+      state.lastUpdate = data.last_update_at || null;
       state.byTopic = data.by_topic || {};
       renderAll();
     }
@@ -786,7 +789,12 @@ INDEX_HTML = r"""
 
     socketioClient.on("mqtt_message", (rec) => {
       state.byTopic[rec.topic] = rec;
-      state.lastUpdate = rec.received_at;         // server UTC ISO
+
+      // ✅ top bar follows MQTT timestamp from this message
+      const p = rec.payload;
+      const ts = (p && typeof p === "object") ? p.timestamp : null;
+      state.lastUpdate = ts || rec.mqtt_ts || rec.received_at || null;
+
       setConnected(true);
       renderAll();
       pushDebug(rec);
@@ -799,8 +807,6 @@ INDEX_HTML = r"""
 </html>
 """
 
-
-
 # =====================================================
 # ROUTES
 # =====================================================
@@ -808,11 +814,9 @@ INDEX_HTML = r"""
 def index():
     return render_template_string(INDEX_HTML)
 
-
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "time": kh_iso()})
-
 
 @app.get("/api/state")
 def api_state():
@@ -821,11 +825,10 @@ def api_state():
             {
                 "ok": True,
                 "mqtt": MQTT_STATUS,
-                "last_update_at": LAST_UPDATE_AT,
-                "by_topic": LAST_BY_TOPIC,
+                "last_update_at": LAST_UPDATE_AT,  # ✅ mqtt timestamp latest
+                "by_topic": LAST_BY_TOPIC,         # includes mqtt_ts + received_at
             }
         )
-
 
 # =====================================================
 # LOCAL RUN (Render uses gunicorn)
