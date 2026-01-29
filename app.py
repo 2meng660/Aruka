@@ -467,7 +467,7 @@ INDEX_HTML = r"""
           <span id="connText">Disconnected</span>
         </div>
         <div class="pill">
-          <span class="small">Last update:</span>
+          <span class="small">toMitoMillis(ts):</span>
           <b id="lastUpdate">--:--:--</b>
         </div>
       </div>
@@ -579,32 +579,34 @@ INDEX_HTML = r"""
     // - "2026-01-29T16:19:11Z," (trailing comma)
     // - "2026-01-29T16:19:11" (no timezone -> treat as UTC)
     // - epoch seconds / ms
+const DEVICE_TS_IS_LOCAL_KH = true; // <-- set true if device sends Cambodia time but adds "Z"
+
     function toMillis(ts){
       if(ts == null) return null;
 
-      // number => epoch
       if(typeof ts === "number"){
-        // if looks like seconds, convert to ms
         return (ts < 2e12) ? ts * 1000 : ts;
       }
 
       if(typeof ts !== "string") return null;
 
-      let s = ts.trim();
+      let s = ts.trim().replace(/,+$/, "");
 
-      // remove trailing comma(s)
-      s = s.replace(/,+$/, "");
-
-      // if ISO with no timezone, treat as UTC by appending Z
-      // (YYYY-MM-DDTHH:mm:ss or YYYY-MM-DD HH:mm:ss)
+      // if it has no timezone -> assume UTC
       if(/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}$/.test(s)){
         s = s.replace(" ", "T") + "Z";
+      }
+
+      // ✅ FIX: device is Cambodia time but wrongly ends with Z
+      if(DEVICE_TS_IS_LOCAL_KH && /Z$/.test(s)){
+        s = s.replace(/Z$/, "+07:00");  // treat as Phnom Penh time
       }
 
       const ms = Date.parse(s);
       if(Number.isNaN(ms)) return null;
       return ms;
     }
+
 
     function fmtTime(ts){
       const ms = toMillis(ts);
