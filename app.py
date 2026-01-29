@@ -578,13 +578,22 @@ INDEX_HTML = r"""
       }
     }
 
-    function fmtTime(iso){
-      if(!iso) return "--:--:--";
-      try{
-        const d = new Date(iso);
-        return d.toLocaleTimeString();
-      }catch(e){ return String(iso); }
+  function fmtTime(iso){
+    if(!iso) return "--:--:--";
+    try{
+      const d = new Date(iso);
+      return new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Phnom_Penh",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }).format(d);
+    }catch(e){
+      return String(iso);
     }
+  }
+
 
     function safeObj(x){
       return (x && typeof x === "object") ? x : null;
@@ -613,11 +622,12 @@ INDEX_HTML = r"""
 
     function renderTemps(){
       const defs = [
-        {topic:TOPICS.t1, title:"Reactor Core", tag:"Probe #1"},
+        {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
         {topic:TOPICS.t2, title:"Primary Burner", tag:"Probe #2"},
         {topic:TOPICS.t3, title:"Secondary Burner", tag:"Probe #3"},
-        {topic:TOPICS.t4, title:"Output Conveyor", tag:"Probe #4"},
+        {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
       ];
+
 
       let html = "";
       for(const d of defs){
@@ -810,3 +820,4 @@ def api_state():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     socketio.run(app, host="0.0.0.0", port=port)
+const defs 
