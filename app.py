@@ -374,7 +374,6 @@ INDEX_HTML = r"""
     }
     .sectionHead h2{margin:0;font-size:14px;letter-spacing:.2px;}
 
-    /* Auto responsive grid (works for laptop + iPhone 12 Pro Max + Android) */
     .cards{
       padding:14px;
       display:grid;
@@ -401,7 +400,6 @@ INDEX_HTML = r"""
     }
     .accentBar > div{height:100%;width:40%;background:linear-gradient(90deg, var(--accent), var(--cyan));}
 
-    /* Burners: responsive auto-fit */
     .burnerRow{
       display:grid;
       grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -447,7 +445,6 @@ INDEX_HTML = r"""
     }
     .foot{margin-top:12px;color:var(--muted);font-size:12px;text-align:right;}
 
-    /* Extra mobile tuning */
     @media (max-width: 480px){
       .title h1{ font-size: 16px; }
       .title p{ font-size: 11px; }
@@ -559,7 +556,7 @@ INDEX_HTML = r"""
 
     const dot = document.getElementById("dot");
     const connText = document.getElementById("connText");
-    const lastUpdate = document.getElementById("lastUpdate");
+    const lastUpdateEl = document.getElementById("lastUpdate");
     const debug = document.getElementById("debug");
 
     const tempCards = document.getElementById("tempCards");
@@ -578,14 +575,12 @@ INDEX_HTML = r"""
       }
     }
 
+    // ✅ KH timezone forced
     function fmtTime(iso){
       if(!iso) return "--:--:--";
       try{
-        // force re-evaluation even if same timestamp string
         const d = new Date(iso);
-
         if (isNaN(d.getTime())) return "--:--:--";
-
         return new Intl.DateTimeFormat("en-GB", {
           timeZone: "Asia/Phnom_Penh",
           hour: "2-digit",
@@ -598,8 +593,14 @@ INDEX_HTML = r"""
       }
     }
 
-
-
+    function computeLastUpdate(){
+      let best = null;
+      for(const t in state.byTopic){
+        const ts = state.byTopic[t]?.received_at;
+        if(ts && (!best || ts > best)) best = ts;
+      }
+      return best;
+    }
 
     function safeObj(x){
       return (x && typeof x === "object") ? x : null;
@@ -634,15 +635,13 @@ INDEX_HTML = r"""
         {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
       ];
 
-
       let html = "";
       for(const d of defs){
         const p = getPayload(d.topic);
         const obj = safeObj(p);
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
-        const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
-
+        const ts = obj?.timestamp ?? state.byTopic[d.topic]?.received_at ?? "";
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
         const num = Number(v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
@@ -657,8 +656,7 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
-
+      const ts = obj?.timestamp ?? state.byTopic[TOPICS.pwr]?.received_at ?? "";
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -685,8 +683,7 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
-
+      const ts = obj?.timestamp ?? state.byTopic[TOPICS.sts]?.received_at ?? "";
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
       const burners = [
@@ -719,11 +716,9 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
-
+      const ts = obj?.timestamp ?? state.byTopic[TOPICS.vfd]?.received_at ?? "";
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
-      /* IMPORTANT: match your real JSON keys exactly */
       const keys = [
         ["Bucket", "BUCKET"],
         ["INLETScrew", "INLET SCREW"],
@@ -752,9 +747,9 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
-      if(state.lastUpdate){
-        lastUpdate.textContent = fmtTime(state.lastUpdate);
-      }
+      // ✅ Always show top last update
+      const lu = state.lastUpdate || computeLastUpdate();
+      lastUpdateEl.textContent = fmtTime(lu);
     }
 
     function pushDebug(rec){
@@ -767,7 +762,7 @@ INDEX_HTML = r"""
       const data = await r.json();
       setConnected(!!data.mqtt.connected);
 
-      state.lastUpdate = data.last_update_at;
+      state.lastUpdate = data.last_update_at; // can be null on cold start
       state.byTopic = data.by_topic || {};
       renderAll();
     }
@@ -784,7 +779,7 @@ INDEX_HTML = r"""
 
     socketioClient.on("mqtt_message", (rec) => {
       state.byTopic[rec.topic] = rec;
-      state.lastUpdate = rec.received_at;
+      state.lastUpdate = rec.received_at; // always filled from server
       setConnected(true);
       renderAll();
       pushDebug(rec);
@@ -796,6 +791,7 @@ INDEX_HTML = r"""
 </body>
 </html>
 """
+
 
 
 # =====================================================
