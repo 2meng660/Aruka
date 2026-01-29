@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
 """
 Aruka / KH-01 Industrial Control Dashboard (Single File)
-
-Run local:
-  python app.py
-
-Render (recommended):
-  gunicorn -w 1 --threads 8 --worker-class gthread --timeout 120 app:app --bind 0.0.0.0:$PORT --log-level info
-
-Env:
-  MQTT_HOST=...
-  MQTT_PORT=8883
-  MQTT_USER=...
-  MQTT_PASS=...
-  MQTT_TLS=1
-  MQTT_TLS_INSECURE=0
-  MQTT_CLIENT_ID=Aruka_KH
-  SECRET_KEY=anystring
 """
 
 import os
@@ -203,7 +187,6 @@ def on_message(client, userdata, msg):
 # MQTT WORKER
 # =====================================================
 def build_mqtt_client() -> mqtt.Client:
-    # Use the correct MQTTv5 parameter name
     c = mqtt.Client(client_id=CLIENT_ID, protocol=mqtt.MQTTv311, clean_session=True)
     c.enable_logger(LOG)
 
@@ -271,7 +254,6 @@ def _start_once():
         if _started:
             return
         _started = True
-        # Start MQTT worker in a separate thread, not using socketio.start_background_task
         threading.Thread(target=mqtt_worker, daemon=True).start()
         LOG.info("Started MQTT background worker")
 
@@ -303,7 +285,7 @@ def api_state():
 
 
 # =====================================================
-# HTML TEMPLATE
+# HTML TEMPLATE - SIMPLIFIED TIMESTAMP FIX
 # =====================================================
 INDEX_HTML = r"""
 <!doctype html>
@@ -559,8 +541,6 @@ INDEX_HTML = r"""
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    const TZ = "Asia/Phnom_Penh";
-
     const TOPICS = {
       t1: "KH/site-01/KH-01/temperature_probe1",
       t2: "KH/site-01/KH-01/temperature_probe2",
@@ -594,74 +574,37 @@ INDEX_HTML = r"""
       }
     }
 
-    // Helper function to format time in Cambodia timezone
+    // SIMPLE FIX: Convert UTC to Cambodia time (+7 hours)
     function formatCambodiaTime(isoString) {
       if (!isoString) return "--:--:--";
       
       try {
+        // Parse the UTC ISO string
         const date = new Date(isoString);
         
-        // Format to Cambodia time (UTC+7)
-        return date.toLocaleTimeString('en-GB', {
-          timeZone: 'Asia/Phnom_Penh',
-          hour12: true,
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit'
-        });
+        // Add 7 hours for Cambodia time (UTC+7)
+        const cambodiaTime = new Date(date.getTime() + (7 * 60 * 60 * 1000));
+        
+        // Format as HH:MM:SS AM/PM
+        let hours = cambodiaTime.getUTCHours();
+        const minutes = cambodiaTime.getUTCMinutes().toString().padStart(2, '0');
+        const seconds = cambodiaTime.getUTCSeconds().toString().padStart(2, '0');
+        const ampm = hours >= 12 ? 'pm' : 'am';
+        
+        // Convert to 12-hour format
+        hours = hours % 12;
+        hours = hours ? hours : 12; // 0 should be 12
+        
+        return `${hours}:${minutes}:${seconds} ${ampm}`;
       } catch (e) {
         console.error("Error formatting time:", e);
         return "--:--:--";
       }
     }
 
-    // Simple timestamp parser - handles UTC ISO strings
-    function parseTimestamp(ts) {
-      if (!ts) return null;
-      
-      // If it's already a Date object
-      if (ts instanceof Date) return ts;
-      
-      // If it's a number (epoch milliseconds or seconds)
-      if (typeof ts === 'number') {
-        return ts < 1e12 ? new Date(ts * 1000) : new Date(ts);
-      }
-      
-      // If it's a string
-      if (typeof ts === 'string') {
-        let str = ts.trim();
-        
-        // Remove any trailing commas or special characters
-        str = str.replace(/[,\s]+$/, '');
-        
-        // If it doesn't have timezone info, assume UTC
-        if (!str.includes('Z') && !str.includes('+')) {
-          str += 'Z';
-        }
-        
-        return new Date(str);
-      }
-      
-      return null;
-    }
-
     function safeObj(x){ return (x && typeof x === "object") ? x : null; }
     function getRec(topic){ return state.byTopic[topic] || null; }
     function getPayload(topic){ const r = getRec(topic); return r ? r.payload : null; }
-
-    // Get the best available timestamp for a topic
-    function getBestTimestamp(topic) {
-      const rec = getRec(topic);
-      if (!rec) return null;
-      
-      // Try to get timestamp from payload first
-      if (rec.payload && rec.payload.timestamp) {
-        return rec.payload.timestamp;
-      }
-      
-      // Fall back to server received time
-      return rec.received_at;
-    }
 
     function cardHTML(label, tag, value, unit, sub, barPct){
       const pct = Math.max(0, Math.min(100, barPct ?? 40));
@@ -681,18 +624,20 @@ INDEX_HTML = r"""
     function renderTemps(){
       const defs = [
         {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
-        {topic:TOPICS.t2, title:"Primary Burner",      tag:"Probe #2"},
-        {topic:TOPICS.t3, title:"Secondary Burner",    tag:"Probe #3"},
-        {topic:TOPICS.t4, title:"Reactor (end)",       tag:"Probe #4"},
+        {topic:TOPICS.t2, title:"Primary Burner", tag:"Probe #2"},
+        {topic:TOPICS.t3, title:"Secondary Burner", tag:"Probe #3"},
+        {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
       ];
 
       let html = "";
       for(const d of defs){
-        const obj = safeObj(getPayload(d.topic));
+        const rec = getRec(d.topic);
+        const obj = safeObj(rec?.payload);
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
 
-        const ts = getBestTimestamp(d.topic);
+        // Use the server received time for ALL cards
+        const ts = rec?.received_at;
         const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
@@ -703,11 +648,12 @@ INDEX_HTML = r"""
     }
 
     function renderPower(){
-      const obj = safeObj(getPayload(TOPICS.pwr));
+      const rec = getRec(TOPICS.pwr);
+      const obj = safeObj(rec?.payload);
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = getBestTimestamp(TOPICS.pwr);
+      const ts = rec?.received_at;
       const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -730,10 +676,11 @@ INDEX_HTML = r"""
     }
 
     function renderBurners(){
-      const obj = safeObj(getPayload(TOPICS.sts));
+      const rec = getRec(TOPICS.sts);
+      const obj = safeObj(rec?.payload);
       const val = safeObj(obj?.value);
 
-      const ts = getBestTimestamp(TOPICS.sts);
+      const ts = rec?.received_at;
       const timeLine = ts ? formatCambodiaTime(ts) : "--:--:--";
 
       const burners = [
@@ -761,23 +708,24 @@ INDEX_HTML = r"""
     }
 
     function renderVFD(){
-      const obj = safeObj(getPayload(TOPICS.vfd));
+      const rec = getRec(TOPICS.vfd);
+      const obj = safeObj(rec?.payload);
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = getBestTimestamp(TOPICS.vfd);
+      const ts = rec?.received_at;
       const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
       const keys = [
-        ["Bucket",     "BUCKET"],
+        ["Bucket", "BUCKET"],
         ["INLETScrew", "INLET SCREW"],
         ["air locker", "AIR LOCKER"],
-        ["exaust1",    "EXHAUST 1"],
-        ["exaust2",    "EXHAUST 2"],
-        ["outscrew1",  "OUTSCREW 1"],
-        ["outscrew2",  "OUTSCREW 2"],
-        ["reactor",    "REACTOR"],
-        ["syn gas",    "SYNGAS"],
+        ["exaust1", "EXHAUST 1"],
+        ["exaust2", "EXHAUST 2"],
+        ["outscrew1", "OUTSCREW 1"],
+        ["outscrew2", "OUTSCREW 2"],
+        ["reactor", "REACTOR"],
+        ["syn gas", "SYNGAS"],
       ];
 
       let html = "";
