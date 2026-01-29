@@ -9,13 +9,13 @@ Render Environment Variables:
   MQTT_HOST=t569f61e.ala.asia-southeast1.emqxsl.com
   MQTT_PORT=8883
   MQTT_USER=KH-01-device
-  MQTT_PASS=Radiation0-Disperser8-Sternum1-Trio4
+  MQTT_PASS=...
   MQTT_TLS=1
   MQTT_TLS_INSECURE=0
   MQTT_CLIENT_ID=Aruka_KH
   SECRET_KEY=anystring
 
-Optional (if you want to override topics):
+Optional (override topics):
   MQTT_TOPICS=KH/site-01/KH-01/temperature_probe1,KH/site-01/KH-01/temperature_probe2,...
 """
 
@@ -27,7 +27,8 @@ import socket
 import logging
 import threading
 import certifi
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template_string
@@ -49,8 +50,12 @@ def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+KH_TZ = ZoneInfo("Asia/Phnom_Penh")
+
+
+def kh_iso() -> str:
+    # Store timestamps already in Cambodia timezone so top bar == cards
+    return datetime.now(KH_TZ).isoformat(timespec="seconds")
 
 
 def safe_json_loads(s: str) -> Any:
@@ -98,7 +103,6 @@ if MQTT_TOPICS_ENV:
 else:
     MQTT_TOPICS = DEFAULT_TOPICS
 
-# Avoid broker kicking you for duplicate client_id: add stable-ish suffix
 HOSTNAME = socket.gethostname()
 CLIENT_ID = f"{BASE_CLIENT_ID}_{HOSTNAME}_{os.getpid()}"
 
@@ -109,7 +113,6 @@ CLIENT_ID = f"{BASE_CLIENT_ID}_{HOSTNAME}_{os.getpid()}"
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 
-# threading mode is safe on Python 3.13 (eventlet is not)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -138,7 +141,7 @@ MQTT_STATUS: Dict[str, Any] = {
     "last_error": None,
 }
 
-LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}  # topic -> payload record
+LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
 LAST_UPDATE_AT: Optional[str] = None
 
 mqtt_client: Optional[mqtt.Client] = None
@@ -151,7 +154,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     LOG.info(f"MQTT on_connect rc={rc}")
     with lock:
         MQTT_STATUS["connected"] = (rc == 0)
-        MQTT_STATUS["last_connect_at"] = utc_iso()
+        MQTT_STATUS["last_connect_at"] = kh_iso()
         MQTT_STATUS["last_error"] = None if rc == 0 else f"connect rc={rc}"
 
     if rc == 0:
@@ -171,7 +174,7 @@ def on_disconnect(client, userdata, rc, properties=None):
     LOG.warning(f"MQTT on_disconnect rc={rc}")
     with lock:
         MQTT_STATUS["connected"] = False
-        MQTT_STATUS["last_disconnect_at"] = utc_iso()
+        MQTT_STATUS["last_disconnect_at"] = kh_iso()
         if rc != 0:
             MQTT_STATUS["last_error"] = f"disconnect rc={rc}"
 
@@ -185,7 +188,7 @@ def on_message(client, userdata, msg):
         record = {
             "topic": msg.topic,
             "payload": parsed,
-            "received_at": utc_iso(),
+            "received_at": kh_iso(),  # ✅ Cambodia time
             "qos": int(getattr(msg, "qos", 0)),
         }
 
@@ -219,7 +222,6 @@ def build_mqtt_client() -> mqtt.Client:
         c.tls_insecure_set(MQTT_TLS_INSECURE)
 
     c.reconnect_delay_set(min_delay=MQTT_RECONNECT_MIN, max_delay=MQTT_RECONNECT_MAX)
-
     c.on_connect = on_connect
     c.on_disconnect = on_disconnect
     c.on_message = on_message
@@ -242,7 +244,6 @@ def mqtt_worker():
                 f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} "
                 f"TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE} client_id={CLIENT_ID}"
             )
-
             mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
             mqtt_client.loop_forever(retry_first_connection=True)
 
@@ -538,6 +539,11 @@ INDEX_HTML = r"""
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
+    // UI bar scaling max (change these if you want different ranges)
+    const MAX_TEMP_C = 900;   // temperature bar max
+    const MAX_CURRENT_A = 100; // current bar max
+    const MAX_FREQ_HZ = 100;  // vfd bar max
+
     const TOPICS = {
       t1: "KH/site-01/KH-01/temperature_probe1",
       t2: "KH/site-01/KH-01/temperature_probe2",
@@ -556,7 +562,7 @@ INDEX_HTML = r"""
 
     const dot = document.getElementById("dot");
     const connText = document.getElementById("connText");
-    const lastUpdateEl = document.getElementById("lastUpdate");
+    const lastUpdate = document.getElementById("lastUpdate");
     const debug = document.getElementById("debug");
 
     const tempCards = document.getElementById("tempCards");
@@ -575,14 +581,14 @@ INDEX_HTML = r"""
       }
     }
 
-    // ✅ KH timezone forced
+    // ✅ We store timestamps already in Cambodia time on the server,
+    // so we just format the time string nicely here.
     function fmtTime(iso){
       if(!iso) return "--:--:--";
       try{
         const d = new Date(iso);
         if (isNaN(d.getTime())) return "--:--:--";
         return new Intl.DateTimeFormat("en-GB", {
-          timeZone: "Asia/Phnom_Penh",
           hour: "2-digit",
           minute: "2-digit",
           second: "2-digit",
@@ -591,15 +597,6 @@ INDEX_HTML = r"""
       }catch(e){
         return "--:--:--";
       }
-    }
-
-    function computeLastUpdate(){
-      let best = null;
-      for(const t in state.byTopic){
-        const ts = state.byTopic[t]?.received_at;
-        if(ts && (!best || ts > best)) best = ts;
-      }
-      return best;
     }
 
     function safeObj(x){
@@ -630,21 +627,26 @@ INDEX_HTML = r"""
     function renderTemps(){
       const defs = [
         {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
-        {topic:TOPICS.t2, title:"Primary Burner", tag:"Probe #2"},
-        {topic:TOPICS.t3, title:"Secondary Burner", tag:"Probe #3"},
-        {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
+        {topic:TOPICS.t2, title:"Primary Burner",     tag:"Probe #2"},
+        {topic:TOPICS.t3, title:"Secondary Burner",   tag:"Probe #3"},
+        {topic:TOPICS.t4, title:"Reactor (end)",      tag:"Probe #4"},
       ];
 
       let html = "";
       for(const d of defs){
         const p = getPayload(d.topic);
         const obj = safeObj(p);
+
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
+
+        // prefer payload timestamp, fallback to server received_at
         const ts = obj?.timestamp ?? state.byTopic[d.topic]?.received_at ?? "";
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
+
         const num = Number(v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_TEMP_C)*100)) : 25;
+
         html += cardHTML(d.title, d.tag, v, unit, sub, pct);
       }
       tempCards.innerHTML = html;
@@ -672,7 +674,7 @@ INDEX_HTML = r"""
       let html = "";
       for(const d of defs){
         const num = Number(d.v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 20;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_CURRENT_A)*100)) : 20;
         html += cardHTML(d.title, "Current", d.v, unit, sub, pct);
       }
       powerCards.innerHTML = html;
@@ -735,7 +737,7 @@ INDEX_HTML = r"""
       for(const [k, label] of keys){
         const v = (val && (k in val)) ? val[k] : "--";
         const num = Number(v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 15;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_FREQ_HZ)*100)) : 15;
         html += cardHTML(label, "VFD", v, unit, sub, pct);
       }
       vfdCards.innerHTML = html;
@@ -747,9 +749,11 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
-      // ✅ Always show top last update
-      const lu = state.lastUpdate || computeLastUpdate();
-      lastUpdateEl.textContent = fmtTime(lu);
+      if(state.lastUpdate){
+        lastUpdate.textContent = fmtTime(state.lastUpdate);
+      } else {
+        lastUpdate.textContent = "--:--:--";
+      }
     }
 
     function pushDebug(rec){
@@ -758,28 +762,23 @@ INDEX_HTML = r"""
     }
 
     async function refreshAll(){
-      const r = await fetch("/api/state");
+      const r = await fetch("/api/state", { cache: "no-store" });
       const data = await r.json();
-      setConnected(!!data.mqtt.connected);
 
-      state.lastUpdate = data.last_update_at; // can be null on cold start
+      setConnected(!!data.mqtt.connected);
+      state.lastUpdate = data.last_update_at;
       state.byTopic = data.by_topic || {};
       renderAll();
     }
 
     const socketioClient = io({ path: "/socket.io", transports: ["websocket","polling"] });
 
-    socketioClient.on("connect", () => {
-      refreshAll();
-    });
-
-    socketioClient.on("disconnect", () => {
-      setConnected(false);
-    });
+    socketioClient.on("connect", () => refreshAll());
+    socketioClient.on("disconnect", () => setConnected(false));
 
     socketioClient.on("mqtt_message", (rec) => {
       state.byTopic[rec.topic] = rec;
-      state.lastUpdate = rec.received_at; // always filled from server
+      state.lastUpdate = rec.received_at;
       setConnected(true);
       renderAll();
       pushDebug(rec);
@@ -793,7 +792,6 @@ INDEX_HTML = r"""
 """
 
 
-
 # =====================================================
 # ROUTES
 # =====================================================
@@ -804,7 +802,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time_utc": utc_iso()})
+    return jsonify({"ok": True, "time": kh_iso()})
 
 
 @app.get("/api/state")
