@@ -539,10 +539,7 @@ INDEX_HTML = r"""
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    // UI bar scaling max (change these if you want different ranges)
-    const MAX_TEMP_C = 900;   // temperature bar max
-    const MAX_CURRENT_A = 100; // current bar max
-    const MAX_FREQ_HZ = 100;  // vfd bar max
+    const TZ = "Asia/Phnom_Penh";
 
     const TOPICS = {
       t1: "KH/site-01/KH-01/temperature_probe1",
@@ -556,7 +553,7 @@ INDEX_HTML = r"""
 
     const state = {
       connected: false,
-      lastUpdate: null,
+      lastUpdate: null, // ALWAYS server time (received_at / last_update_at)
       byTopic: {},
     };
 
@@ -581,14 +578,14 @@ INDEX_HTML = r"""
       }
     }
 
-    // ✅ We store timestamps already in Cambodia time on the server,
-    // so we just format the time string nicely here.
+    // ✅ single, stable formatter (server ISO -> Phnom Penh time)
     function fmtTime(iso){
       if(!iso) return "--:--:--";
       try{
         const d = new Date(iso);
         if (isNaN(d.getTime())) return "--:--:--";
         return new Intl.DateTimeFormat("en-GB", {
+          timeZone: TZ,
           hour: "2-digit",
           minute: "2-digit",
           second: "2-digit",
@@ -603,10 +600,19 @@ INDEX_HTML = r"""
       return (x && typeof x === "object") ? x : null;
     }
 
+    function getRec(topic){
+      return state.byTopic[topic] || null;
+    }
+
     function getPayload(topic){
-      const rec = state.byTopic[topic];
-      if(!rec) return null;
-      return rec.payload;
+      const rec = getRec(topic);
+      return rec ? rec.payload : null;
+    }
+
+    // ✅ always prefer server receive time (rec.received_at)
+    function getServerTs(topic){
+      const rec = getRec(topic);
+      return rec?.received_at || "";
     }
 
     function cardHTML(label, tag, value, unit, sub, barPct){
@@ -627,26 +633,23 @@ INDEX_HTML = r"""
     function renderTemps(){
       const defs = [
         {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
-        {topic:TOPICS.t2, title:"Primary Burner",     tag:"Probe #2"},
-        {topic:TOPICS.t3, title:"Secondary Burner",   tag:"Probe #3"},
-        {topic:TOPICS.t4, title:"Reactor (end)",      tag:"Probe #4"},
+        {topic:TOPICS.t2, title:"Primary Burner",      tag:"Probe #2"},
+        {topic:TOPICS.t3, title:"Secondary Burner",    tag:"Probe #3"},
+        {topic:TOPICS.t4, title:"Reactor (end)",       tag:"Probe #4"},
       ];
 
       let html = "";
       for(const d of defs){
         const p = getPayload(d.topic);
         const obj = safeObj(p);
-
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
 
-        // prefer payload timestamp, fallback to server received_at
-        const ts = obj?.timestamp ?? state.byTopic[d.topic]?.received_at ?? "";
+        const ts = getServerTs(d.topic);
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_TEMP_C)*100)) : 25;
-
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
         html += cardHTML(d.title, d.tag, v, unit, sub, pct);
       }
       tempCards.innerHTML = html;
@@ -658,7 +661,7 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.pwr]?.received_at ?? "";
+      const ts = getServerTs(TOPICS.pwr);
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -674,7 +677,7 @@ INDEX_HTML = r"""
       let html = "";
       for(const d of defs){
         const num = Number(d.v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_CURRENT_A)*100)) : 20;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 20;
         html += cardHTML(d.title, "Current", d.v, unit, sub, pct);
       }
       powerCards.innerHTML = html;
@@ -685,7 +688,7 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.sts]?.received_at ?? "";
+      const ts = getServerTs(TOPICS.sts);
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
       const burners = [
@@ -718,26 +721,26 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.vfd]?.received_at ?? "";
+      const ts = getServerTs(TOPICS.vfd);
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const keys = [
-        ["Bucket", "BUCKET"],
+        ["Bucket",     "BUCKET"],
         ["INLETScrew", "INLET SCREW"],
         ["air locker", "AIR LOCKER"],
-        ["exaust1", "EXHAUST 1"],
-        ["exaust2", "EXHAUST 2"],
-        ["outscrew1", "OUTSCREW 1"],
-        ["outscrew2", "OUTSCREW 2"],
-        ["reactor", "REACTOR"],
-        ["syn gas", "SYNGAS"],
+        ["exaust1",    "EXHAUST 1"],
+        ["exaust2",    "EXHAUST 2"],
+        ["outscrew1",  "OUTSCREW 1"],
+        ["outscrew2",  "OUTSCREW 2"],
+        ["reactor",    "REACTOR"],
+        ["syn gas",    "SYNGAS"],
       ];
 
       let html = "";
       for(const [k, label] of keys){
         const v = (val && (k in val)) ? val[k] : "--";
         const num = Number(v);
-        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/MAX_FREQ_HZ)*100)) : 15;
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 15;
         html += cardHTML(label, "VFD", v, unit, sub, pct);
       }
       vfdCards.innerHTML = html;
@@ -749,6 +752,7 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
+      // ✅ top bar also uses server time, formatted to Phnom Penh
       if(state.lastUpdate){
         lastUpdate.textContent = fmtTime(state.lastUpdate);
       } else {
@@ -764,9 +768,9 @@ INDEX_HTML = r"""
     async function refreshAll(){
       const r = await fetch("/api/state", { cache: "no-store" });
       const data = await r.json();
-
       setConnected(!!data.mqtt.connected);
-      state.lastUpdate = data.last_update_at;
+
+      state.lastUpdate = data.last_update_at;     // server UTC ISO
       state.byTopic = data.by_topic || {};
       renderAll();
     }
@@ -778,7 +782,7 @@ INDEX_HTML = r"""
 
     socketioClient.on("mqtt_message", (rec) => {
       state.byTopic[rec.topic] = rec;
-      state.lastUpdate = rec.received_at;
+      state.lastUpdate = rec.received_at;         // server UTC ISO
       setConnected(true);
       renderAll();
       pushDebug(rec);
@@ -790,6 +794,7 @@ INDEX_HTML = r"""
 </body>
 </html>
 """
+
 
 
 # =====================================================
