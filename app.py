@@ -581,20 +581,20 @@ INDEX_HTML = r"""
     // ✅ single, stable formatter (server ISO -> Phnom Penh time)
     function fmtTime(iso){
       if(!iso) return "--:--:--";
-      try{
-        const d = new Date(iso);
-        if (isNaN(d.getTime())) return "--:--:--";
-        return new Intl.DateTimeFormat("en-GB", {
-          timeZone: TZ,
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-          hour12: true
-        }).format(d);
-      }catch(e){
-        return "--:--:--";
-      }
+
+      const d = new Date(iso); // parses ISO + Z correctly
+
+      if (isNaN(d.getTime())) return "--:--:--";
+
+      return new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Phnom_Penh",   // convert UTC → Cambodia
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }).format(d);
     }
+
 
     function safeObj(x){
       return (x && typeof x === "object") ? x : null;
@@ -645,7 +645,8 @@ INDEX_HTML = r"""
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
 
-        const ts = getServerTs(d.topic);
+        const ts = obj?.timestamp;
+
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
@@ -661,7 +662,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = getServerTs(TOPICS.pwr);
+      const ts = obj?.timestamp;
+
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -688,7 +690,8 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const ts = getServerTs(TOPICS.sts);
+      const ts = obj?.timestamp;
+
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
       const burners = [
@@ -721,7 +724,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = getServerTs(TOPICS.vfd);
+      const ts = obj?.timestamp;
+
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const keys = [
