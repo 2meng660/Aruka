@@ -641,7 +641,8 @@ INDEX_HTML = r"""
         const obj = safeObj(p);
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
-        const ts = obj?.timestamp ?? state.byTopic[d.topic]?.received_at ?? "";
+        const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
+
         const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
         const num = Number(v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
@@ -656,7 +657,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.pwr]?.received_at ?? "";
+      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
+
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
@@ -683,7 +685,8 @@ INDEX_HTML = r"""
       const obj = safeObj(p);
       const val = safeObj(obj?.value);
 
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.sts]?.received_at ?? "";
+      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
+
       const timeLine = ts ? fmtTime(ts) : "--:--:--";
 
       const burners = [
@@ -716,7 +719,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = obj?.timestamp ?? state.byTopic[TOPICS.vfd]?.received_at ?? "";
+      const ts = state.byTopic[d.topic]?.received_at ?? obj?.timestamp ?? "";
+
       const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
 
       /* IMPORTANT: match your real JSON keys exactly */
