@@ -203,6 +203,7 @@ def on_message(client, userdata, msg):
 # MQTT WORKER
 # =====================================================
 def build_mqtt_client() -> mqtt.Client:
+    # Use the correct MQTTv5 parameter name
     c = mqtt.Client(client_id=CLIENT_ID, protocol=mqtt.MQTTv311, clean_session=True)
     c.enable_logger(LOG)
 
@@ -270,12 +271,39 @@ def _start_once():
         if _started:
             return
         _started = True
-        socketio.start_background_task(mqtt_worker)
+        # Start MQTT worker in a separate thread, not using socketio.start_background_task
+        threading.Thread(target=mqtt_worker, daemon=True).start()
         LOG.info("Started MQTT background worker")
 
 
 # =====================================================
-# UI (Responsive Dashboard)
+# ROUTES
+# =====================================================
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time_utc": utc_iso_z()})
+
+
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(
+            {
+                "ok": True,
+                "mqtt": MQTT_STATUS,
+                "last_update_at": LAST_UPDATE_AT,
+                "by_topic": LAST_BY_TOPIC,
+            }
+        )
+
+
+# =====================================================
+# HTML TEMPLATE (unchanged)
 # =====================================================
 INDEX_HTML = r"""
 <!doctype html>
@@ -797,34 +825,8 @@ INDEX_HTML = r"""
 
 
 # =====================================================
-# ROUTES
-# =====================================================
-@app.get("/")
-def index():
-    return render_template_string(INDEX_HTML)
-
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "time_utc": utc_iso_z()})
-
-
-@app.get("/api/state")
-def api_state():
-    with lock:
-        return jsonify(
-            {
-                "ok": True,
-                "mqtt": MQTT_STATUS,
-                "last_update_at": LAST_UPDATE_AT,
-                "by_topic": LAST_BY_TOPIC,
-            }
-        )
-
-
-# =====================================================
 # LOCAL RUN
 # =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    socketio.run(app, host="0.0.0.0", port=port)
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
