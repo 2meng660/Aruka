@@ -578,21 +578,27 @@ INDEX_HTML = r"""
       }
     }
 
-  function fmtTime(iso){
-    if(!iso) return "--:--:--";
-    try{
-      const d = new Date(iso);
-      return new Intl.DateTimeFormat("en-GB", {
-        timeZone: "Asia/Phnom_Penh",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: true
-      }).format(d);
-    }catch(e){
-      return String(iso);
+    function fmtTime(iso){
+      if(!iso) return "--:--:--";
+      try{
+        // force re-evaluation even if same timestamp string
+        const d = new Date(iso);
+
+        if (isNaN(d.getTime())) return "--:--:--";
+
+        return new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Phnom_Penh",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: true
+        }).format(d);
+      }catch(e){
+        return "--:--:--";
+      }
     }
-  }
+
+
 
 
     function safeObj(x){
