@@ -97,7 +97,7 @@ def normalize_mqtt_timestamp(ts: Any) -> Optional[str]:
 MQTT_HOST = os.environ.get("MQTT_HOST", "t569f61e.ala.asia-southeast1.emqxsl.com").strip()
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ.get("MQTT_USER", "KH-01-device").strip()
-MQTT_PASS = os.environ.get("MQTT_PASS", "").strip()
+MQTT_PASS = os.environ.get("MQTT_PASS", "Radiation0-Disperser8-Sternum1-Trio4").strip()
 
 MQTT_TLS = env_bool("MQTT_TLS", "1")
 MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")
