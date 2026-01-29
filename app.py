@@ -303,7 +303,7 @@ def api_state():
 
 
 # =====================================================
-# HTML TEMPLATE (unchanged)
+# HTML TEMPLATE
 # =====================================================
 INDEX_HTML = r"""
 <!doctype html>
@@ -594,61 +594,73 @@ INDEX_HTML = r"""
       }
     }
 
-    const timeFmt = new Intl.DateTimeFormat("en-GB", {
-      timeZone: TZ,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: true
-    });
-
-    // ✅ robust parse: handles:
-    // - "2026-01-29T16:19:11Z"
-    // - "2026-01-29T16:19:11Z," (trailing comma)
-    // - "2026-01-29T16:19:11" (no timezone -> treat as UTC)
-    // - epoch seconds / ms
-    function toMillis(ts){
-      if(ts == null) return null;
-
-      // number => epoch
-      if(typeof ts === "number"){
-        // if looks like seconds, convert to ms
-        return (ts < 2e12) ? ts * 1000 : ts;
+    // Helper function to format time in Cambodia timezone
+    function formatCambodiaTime(isoString) {
+      if (!isoString) return "--:--:--";
+      
+      try {
+        const date = new Date(isoString);
+        
+        // Format to Cambodia time (UTC+7)
+        return date.toLocaleTimeString('en-GB', {
+          timeZone: 'Asia/Phnom_Penh',
+          hour12: true,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit'
+        });
+      } catch (e) {
+        console.error("Error formatting time:", e);
+        return "--:--:--";
       }
-
-      if(typeof ts !== "string") return null;
-
-      let s = ts.trim();
-
-      // remove trailing comma(s)
-      s = s.replace(/,+$/, "");
-
-      // if ISO with no timezone, treat as UTC by appending Z
-      // (YYYY-MM-DDTHH:mm:ss or YYYY-MM-DD HH:mm:ss)
-      if(/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}$/.test(s)){
-        s = s.replace(" ", "T") + "Z";
-      }
-
-      const ms = Date.parse(s);
-      if(Number.isNaN(ms)) return null;
-      return ms;
     }
 
-    function fmtTime(ts){
-      const ms = toMillis(ts);
-      if(ms == null) return "--:--:--";
-      return timeFmt.format(new Date(ms));
+    // Simple timestamp parser - handles UTC ISO strings
+    function parseTimestamp(ts) {
+      if (!ts) return null;
+      
+      // If it's already a Date object
+      if (ts instanceof Date) return ts;
+      
+      // If it's a number (epoch milliseconds or seconds)
+      if (typeof ts === 'number') {
+        return ts < 1e12 ? new Date(ts * 1000) : new Date(ts);
+      }
+      
+      // If it's a string
+      if (typeof ts === 'string') {
+        let str = ts.trim();
+        
+        // Remove any trailing commas or special characters
+        str = str.replace(/[,\s]+$/, '');
+        
+        // If it doesn't have timezone info, assume UTC
+        if (!str.includes('Z') && !str.includes('+')) {
+          str += 'Z';
+        }
+        
+        return new Date(str);
+      }
+      
+      return null;
     }
 
     function safeObj(x){ return (x && typeof x === "object") ? x : null; }
     function getRec(topic){ return state.byTopic[topic] || null; }
     function getPayload(topic){ const r = getRec(topic); return r ? r.payload : null; }
-    function getServerTs(topic){ const r = getRec(topic); return r?.received_at || ""; }
 
-    // ✅ choose MQTT timestamp first, fallback to server received_at
-    function pickTs(topic, payloadObj){
-      const mqttTs = payloadObj?.timestamp;
-      return mqttTs || getServerTs(topic) || state.lastUpdate || "";
+    // Get the best available timestamp for a topic
+    function getBestTimestamp(topic) {
+      const rec = getRec(topic);
+      if (!rec) return null;
+      
+      // Try to get timestamp from payload first
+      if (rec.payload && rec.payload.timestamp) {
+        return rec.payload.timestamp;
+      }
+      
+      // Fall back to server received time
+      return rec.received_at;
     }
 
     function cardHTML(label, tag, value, unit, sub, barPct){
@@ -680,8 +692,8 @@ INDEX_HTML = r"""
         const v = obj?.value ?? "--";
         const unit = obj?.unit ?? "°C";
 
-        const ts = pickTs(d.topic, obj);
-        const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
+        const ts = getBestTimestamp(d.topic);
+        const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
@@ -695,8 +707,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "A";
-      const ts = pickTs(TOPICS.pwr, obj);
-      const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
+      const ts = getBestTimestamp(TOPICS.pwr);
+      const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
       const a = val?.phaseA ?? "--";
       const b = val?.phaseB ?? "--";
@@ -721,8 +733,8 @@ INDEX_HTML = r"""
       const obj = safeObj(getPayload(TOPICS.sts));
       const val = safeObj(obj?.value);
 
-      const ts = pickTs(TOPICS.sts, obj);
-      const timeLine = ts ? fmtTime(ts) : "--:--:--";
+      const ts = getBestTimestamp(TOPICS.sts);
+      const timeLine = ts ? formatCambodiaTime(ts) : "--:--:--";
 
       const burners = [
         {k:"burner1", name:"Burner #1", sub:"Primary"},
@@ -753,8 +765,8 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const unit = obj?.unit || "Hz";
-      const ts = pickTs(TOPICS.vfd, obj);
-      const sub = ts ? ("Updated: " + fmtTime(ts)) : "Waiting for data...";
+      const ts = getBestTimestamp(TOPICS.vfd);
+      const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
       const keys = [
         ["Bucket",     "BUCKET"],
@@ -784,8 +796,8 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
-      // Top bar should follow last server message time
-      lastUpdate.textContent = state.lastUpdate ? fmtTime(state.lastUpdate) : "--:--:--";
+      // Update top bar with last update time (in Cambodia time)
+      lastUpdate.textContent = state.lastUpdate ? formatCambodiaTime(state.lastUpdate) : "--:--:--";
     }
 
     function pushDebug(rec){
@@ -794,29 +806,50 @@ INDEX_HTML = r"""
     }
 
     async function refreshAll(){
-      const r = await fetch("/api/state", { cache: "no-store" });
-      const data = await r.json();
+      try {
+        const r = await fetch("/api/state", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        
+        const data = await r.json();
 
-      setConnected(!!data.mqtt.connected);
-      state.lastUpdate = data.last_update_at || null;
-      state.byTopic = data.by_topic || {};
-      renderAll();
+        setConnected(!!data.mqtt.connected);
+        
+        // Update state with server data
+        state.lastUpdate = data.last_update_at || null;
+        state.byTopic = data.by_topic || {};
+        
+        renderAll();
+      } catch (err) {
+        console.error("Refresh error:", err);
+        setConnected(false);
+      }
     }
 
     const socketioClient = io({ path: "/socket.io", transports: ["websocket","polling"] });
 
-    socketioClient.on("connect", () => refreshAll());
-    socketioClient.on("disconnect", () => setConnected(false));
+    socketioClient.on("connect", () => {
+      console.log("Socket.IO connected");
+      refreshAll();
+    });
+    
+    socketioClient.on("disconnect", () => {
+      console.log("Socket.IO disconnected");
+      setConnected(false);
+    });
 
     socketioClient.on("mqtt_message", (rec) => {
+      console.log("MQTT message received:", rec.topic);
       state.byTopic[rec.topic] = rec;
-      state.lastUpdate = rec.received_at || rec?.payload?.timestamp || state.lastUpdate;
+      state.lastUpdate = rec.received_at || null;
       setConnected(true);
       renderAll();
       pushDebug(rec);
     });
 
+    // Initial load
     refreshAll();
+    
+    // Auto-refresh every 5 seconds
     setInterval(refreshAll, 5000);
   </script>
 </body>
