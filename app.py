@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""
+Aruka / KH-01 Industrial Control Dashboard (Single File)
+
+Fixes included:
+- Correct Cambodia time display using browser timezone "Asia/Phnom_Penh" (no manual +7h math)
+- "Last update" = latest message among ALL topics (global)
+- Each card "Updated" = last message time for THAT topic (per-topic)
+- Shows "STALE" badge if a topic hasn't updated within STALE_SECONDS (default 120s)
+"""
+
+import os
+import ssl
+import json
+import time
+import socket
+import logging
+import threading
+import certifi
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from flask import Flask, jsonify, render_template_string
+from flask_socketio import SocketIO
+import paho.mqtt.client as mqtt
+
+# =====================================================
+# LOGGING
+# =====================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+LOG = logging.getLogger("KH01")
+
+# =====================================================
+# HELPERS
+# =====================================================
+def env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+def utc_iso_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def safe_json_loads(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
+
+def norm_topic(s: str) -> str:
+    return (s or "").strip()
+
+# =====================================================
+# CONFIG
+# =====================================================
+MQTT_HOST = os.environ.get("MQTT_HOST", "t569f61e.ala.asia-southeast1.emqxsl.com").strip()
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USER = os.environ.get("MQTT_USER", "KH-01-device").strip()
+MQTT_PASS = os.environ.get("MQTT_PASS", "Radiation0-Disperser8-Sternum1-Trio4").strip()
+
+MQTT_TLS = env_bool("MQTT_TLS", "1")
+MQTT_TLS_INSECURE = env_bool("MQTT_TLS_INSECURE", "0")
+
+BASE_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "Aruka_KH").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-me").strip()
+
+MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
+MQTT_RECONNECT_MIN = int(os.environ.get("MQTT_RECONNECT_MIN", "1"))
+MQTT_RECONNECT_MAX = int(os.environ.get("MQTT_RECONNECT_MAX", "30"))
+
+STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "120"))  # show STALE if no update in this many seconds
+
+DEFAULT_TOPICS = [
+    "KH/site-01/KH-01/temperature_probe1",
+    "KH/site-01/KH-01/temperature_probe2",
+    "KH/site-01/KH-01/temperature_probe3",
+    "KH/site-01/KH-01/temperature_probe4",
+    "KH/site-01/KH-01/vfd_frequency",
+    "KH/site-01/KH-01/power_consumption",
+    "KH/site-01/KH-01/status",
+]
+
+MQTT_TOPICS_ENV = os.environ.get("MQTT_TOPICS", "").strip()
+if MQTT_TOPICS_ENV:
+    MQTT_TOPICS: List[str] = [norm_topic(x) for x in MQTT_TOPICS_ENV.split(",") if norm_topic(x)]
+else:
+    MQTT_TOPICS = DEFAULT_TOPICS
+
+HOSTNAME = socket.gethostname()
+CLIENT_ID = f"{BASE_CLIENT_ID}_{HOSTNAME}_{os.getpid()}"
+
+# =====================================================
+# FLASK / SOCKETIO
+# =====================================================
+app = Flask(__name__)
+app.config["SECRET_KEY"] = SECRET_KEY
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    path="socket.io",
+    ping_interval=25,
+    ping_timeout=60,
+)
+
+# =====================================================
+# SHARED STATE
+# =====================================================
+lock = threading.Lock()
+
+MQTT_STATUS: Dict[str, Any] = {
+    "connected": False,
+    "host": MQTT_HOST,
+    "port": MQTT_PORT,
+    "tls": MQTT_TLS,
+    "tls_insecure": MQTT_TLS_INSECURE,
+    "client_id": CLIENT_ID,
+    "topics": MQTT_TOPICS,
+    "last_connect_at": None,
+    "last_disconnect_at": None,
+    "last_error": None,
+}
+
+LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
+LAST_UPDATE_AT: Optional[str] = None  # global latest received_at (UTC Z)
+mqtt_client: Optional[mqtt.Client] = None
+
+# =====================================================
+# MQTT CALLBACKS
+# =====================================================
+def on_connect(client, userdata, flags, rc, properties=None):
+    LOG.info(f"MQTT on_connect rc={rc}")
+    with lock:
+        MQTT_STATUS["connected"] = (rc == 0)
+        MQTT_STATUS["last_connect_at"] = utc_iso_z()
+        MQTT_STATUS["last_error"] = None if rc == 0 else f"connect rc={rc}"
+
+    if rc == 0:
+        ok = 0
+        for t in MQTT_TOPICS:
+            try:
+                client.subscribe(t, qos=0)
+                ok += 1
+            except Exception as e:
+                LOG.error(f"Subscribe failed for {t}: {e}")
+                with lock:
+                    MQTT_STATUS["last_error"] = f"subscribe failed: {e}"
+        LOG.info(f"Subscribed to {ok}/{len(MQTT_TOPICS)} topics")
+
+def on_disconnect(client, userdata, rc, properties=None):
+    LOG.warning(f"MQTT on_disconnect rc={rc}")
+    with lock:
+        MQTT_STATUS["connected"] = False
+        MQTT_STATUS["last_disconnect_at"] = utc_iso_z()
+        if rc != 0:
+            MQTT_STATUS["last_error"] = f"disconnect rc={rc}"
+
+def on_message(client, userdata, msg):
+    global LAST_UPDATE_AT
+    try:
+        raw = msg.payload.decode("utf-8", errors="replace")
+        parsed = safe_json_loads(raw)
+
+        record = {
+            "topic": msg.topic,
+            "payload": parsed,
+            "received_at": utc_iso_z(),  # always UTC Z
+            "qos": int(getattr(msg, "qos", 0)),
+        }
+
+        with lock:
+            LAST_BY_TOPIC[msg.topic] = record
+            LAST_UPDATE_AT = record["received_at"]  # global latest
+
+        socketio.emit("mqtt_message", record)
+
+    except Exception as e:
+        LOG.exception("on_message error")
+        with lock:
+            MQTT_STATUS["last_error"] = f"on_message error: {e}"
+
+# =====================================================
+# MQTT WORKER
+# =====================================================
+def build_mqtt_client() -> mqtt.Client:
+    c = mqtt.Client(client_id=CLIENT_ID, protocol=mqtt.MQTTv311, clean_session=True)
+    c.enable_logger(LOG)
+
+    if MQTT_USER:
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
+
+    if MQTT_TLS:
+        c.tls_set(
+            ca_certs=certifi.where(),
+            tls_version=ssl.PROTOCOL_TLS_CLIENT,
+        )
+        c.tls_insecure_set(MQTT_TLS_INSECURE)
+
+    c.reconnect_delay_set(min_delay=MQTT_RECONNECT_MIN, max_delay=MQTT_RECONNECT_MAX)
+    c.on_connect = on_connect
+    c.on_disconnect = on_disconnect
+    c.on_message = on_message
+    return c
+
+def mqtt_worker():
+    global mqtt_client
+
+    if not MQTT_HOST:
+        LOG.error("MQTT_HOST is empty. Set MQTT_HOST in environment variables.")
+        with lock:
+            MQTT_STATUS["last_error"] = "MQTT_HOST not set"
+        return
+
+    while True:
+        try:
+            mqtt_client = build_mqtt_client()
+            LOG.info(
+                f"MQTT connecting to {MQTT_HOST}:{MQTT_PORT} "
+                f"TLS={MQTT_TLS} insecure={MQTT_TLS_INSECURE} client_id={CLIENT_ID}"
+            )
+            mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
+            mqtt_client.loop_forever(retry_first_connection=True)
+
+        except Exception as e:
+            LOG.error(f"MQTT worker exception: {e}")
+            with lock:
+                MQTT_STATUS["connected"] = False
+                MQTT_STATUS["last_error"] = str(e)
+
+            try:
+                if mqtt_client:
+                    mqtt_client.disconnect()
+            except Exception:
+                pass
+
+            time.sleep(3)
+
+_started = False
+_started_lock = threading.Lock()
+
+@app.before_request
+def _start_once():
+    global _started
+    if _started:
+        return
+    with _started_lock:
+        if _started:
+            return
+        _started = True
+        threading.Thread(target=mqtt_worker, daemon=True).start()
+        LOG.info("Started MQTT background worker")
+
+# =====================================================
+# ROUTES
+# =====================================================
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML)
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time_utc": utc_iso_z()})
+
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(
+            {
+                "ok": True,
+                "mqtt": MQTT_STATUS,
+                "last_update_at": LAST_UPDATE_AT,
+                "by_topic": LAST_BY_TOPIC,
+                "stale_seconds": STALE_SECONDS,
+            }
+        )
+
+# =====================================================
+# HTML TEMPLATE
+# =====================================================
+INDEX_HTML = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>KH-01 Industrial Control</title>
+  <style>
+    :root{
+      --bg0:#070b12;
+      --bg1:#0b1220;
+      --line:rgba(255,255,255,.08);
+      --muted:rgba(255,255,255,.65);
+      --text:#e9eefc;
+      --accent:#36d399;
+      --danger:#ef4444;
+      --warn:#f59e0b;
+      --blue:#60a5fa;
+      --cyan:#22d3ee;
+    }
+    *{box-sizing:border-box;}
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 700px at 20% 10%, rgba(96,165,250,.14), transparent 55%),
+        radial-gradient(1000px 600px at 70% 40%, rgba(34,211,238,.10), transparent 60%),
+        linear-gradient(180deg, var(--bg1), var(--bg0));
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif;
+    }
+    .wrap{
+      max-width:1100px;
+      margin:0 auto;
+      padding:
+        calc(18px + env(safe-area-inset-top))
+        calc(14px + env(safe-area-inset-right))
+        40px
+        calc(14px + env(safe-area-inset-left));
+    }
+    .topbar{
+      display:flex;align-items:center;justify-content:space-between;
+      gap:12px;flex-wrap:wrap;
+      padding:14px 16px;border:1px solid var(--line);border-radius:16px;
+      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      backdrop-filter: blur(8px);
+    }
+    .brand{display:flex;gap:12px;align-items:center;}
+    .logo{
+      width:36px;height:36px;border-radius:10px;
+      background:linear-gradient(135deg, rgba(96,165,250,.9), rgba(34,211,238,.8));
+      display:flex;align-items:center;justify-content:center;
+      box-shadow: 0 10px 30px rgba(34,211,238,.18);
+      font-weight:800;color:#08111f;
+      flex:0 0 auto;
+    }
+    .title h1{margin:0;font-size:18px;letter-spacing:.2px;}
+    .title p{margin:2px 0 0;color:var(--muted);font-size:12px;}
+
+    .statusbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
+    .pill{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:8px 12px;border-radius:999px;border:1px solid var(--line);
+      background:rgba(255,255,255,.03);
+      font-size:13px;color:var(--muted);
+    }
+    .dot{width:10px;height:10px;border-radius:50%;}
+    .dot.ok{background:var(--accent);box-shadow:0 0 0 4px rgba(54,211,153,.12);}
+    .dot.bad{background:var(--danger);box-shadow:0 0 0 4px rgba(239,68,68,.12);}
+    .small{font-size:12px;color:var(--muted);}
+
+    .section{
+      margin-top:14px;
+      border:1px solid var(--line);border-radius:16px;
+      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      overflow:hidden;
+    }
+    .sectionHead{
+      display:flex;align-items:center;justify-content:space-between;
+      gap:10px;
+      padding:12px 14px;border-bottom:1px solid var(--line);
+      flex-wrap:wrap;
+    }
+    .sectionHead .left{display:flex;gap:10px;align-items:center;}
+    .ico{
+      width:30px;height:30px;border-radius:10px;
+      display:flex;align-items:center;justify-content:center;
+      background:rgba(96,165,250,.18);border:1px solid rgba(96,165,250,.25);
+      color:#bcd7ff;font-weight:700;
+      flex:0 0 auto;
+    }
+    .sectionHead h2{margin:0;font-size:14px;letter-spacing:.2px;}
+
+    .cards{
+      padding:14px;
+      display:grid;
+      gap:12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .card{
+      border:1px solid var(--line);border-radius:16px;
+      background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01));
+      padding:14px;
+      min-height:92px;
+    }
+    .card .label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;align-items:center;}
+    .tag{
+      padding:4px 8px;border-radius:999px;border:1px solid var(--line);
+      background:rgba(255,255,255,.03);color:rgba(255,255,255,.72);font-size:11px;white-space:nowrap;
+    }
+    .tag.stale{
+      border-color: rgba(245,158,11,.35);
+      color: rgba(245,158,11,.95);
+      background: rgba(245,158,11,.08);
+      font-weight:800;
+    }
+    .value{margin-top:10px;font-size:34px;font-weight:800;letter-spacing:.4px;}
+    .unit{font-size:14px;color:rgba(255,255,255,.75);font-weight:700;margin-left:8px;}
+    .sub{margin-top:6px;font-size:12px;color:var(--muted);}
+    .accentBar{
+      height:3px;border-radius:999px;margin-top:10px;background:rgba(255,255,255,.10);overflow:hidden;
+    }
+    .accentBar > div{height:100%;width:40%;background:linear-gradient(90deg, var(--accent), var(--cyan));}
+
+    .burnerRow{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap:12px;
+      padding:14px;
+    }
+    .burner{
+      border:1px solid rgba(239,68,68,.45);
+      border-radius:16px;padding:14px;
+      background:linear-gradient(180deg, rgba(239,68,68,.10), rgba(255,255,255,.01));
+      display:flex;justify-content:space-between;align-items:center;gap:12px;
+    }
+    .burner.on{
+      border-color: rgba(54,211,153,.45);
+      background:linear-gradient(180deg, rgba(54,211,153,.12), rgba(255,255,255,.01));
+    }
+    .burner .bname{font-weight:800;}
+    .burner .bsub{margin-top:3px;font-size:12px;color:var(--muted);}
+    .badge{
+      padding:7px 12px;border-radius:999px;font-weight:800;font-size:12px;
+      border:1px solid var(--line);background:rgba(0,0,0,.18);
+      min-width:64px;text-align:center;
+    }
+    .badge.off{color:rgba(255,255,255,.65);}
+    .badge.on{color:var(--accent);border-color:rgba(54,211,153,.35);}
+
+    .toolbar{display:flex;gap:10px;align-items:center;}
+    button{
+      cursor:pointer;
+      padding:8px 12px;border-radius:12px;
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.04);
+      color:rgba(255,255,255,.86);
+    }
+    button:hover{background:rgba(255,255,255,.06);}
+    pre{
+      margin:0;
+      padding:12px 14px;
+      color:rgba(255,255,255,.82);
+      overflow:auto;max-height:220px;
+      background:rgba(0,0,0,.18);
+      border-top:1px solid var(--line);
+    }
+    .foot{margin-top:12px;color:var(--muted);font-size:12px;text-align:right;}
+
+    @media (max-width: 480px){
+      .title h1{ font-size: 16px; }
+      .title p{ font-size: 11px; }
+      .pill{ padding: 7px 10px; font-size: 12px; }
+      .sectionHead{ padding: 10px 12px; }
+      .cards, .burnerRow{ padding: 12px; gap: 10px; }
+      .card{ padding: 12px; border-radius: 14px; }
+      .value{ font-size: 28px; }
+      .unit{ font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">KH</div>
+        <div class="title">
+          <h1>KH-01 INDUSTRIAL CONTROL</h1>
+          <p>Real-time process monitoring dashboard</p>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <div class="pill">
+          <span id="dot" class="dot bad"></span>
+          <span id="connText">Disconnected</span>
+        </div>
+        <div class="pill">
+          <span class="small">Last update:</span>
+          <b id="lastUpdate">--:--:--</b>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHead">
+        <div class="left">
+          <div class="ico">T</div>
+          <h2>Temperature Monitoring</h2>
+        </div>
+        <div class="toolbar">
+          <button onclick="refreshAll()">Refresh</button>
+        </div>
+      </div>
+      <div class="cards" id="tempCards"></div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHead">
+        <div class="left">
+          <div class="ico">P</div>
+          <h2>Power Consumption</h2>
+        </div>
+      </div>
+      <div class="cards" id="powerCards"></div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHead">
+        <div class="left">
+          <div class="ico">B</div>
+          <h2>Burner Status</h2>
+        </div>
+      </div>
+      <div class="burnerRow" id="burnerRow"></div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHead">
+        <div class="left">
+          <div class="ico">V</div>
+          <h2>VFD Frequency Control</h2>
+        </div>
+      </div>
+      <div class="cards" id="vfdCards"></div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHead">
+        <div class="left">
+          <div class="ico">D</div>
+          <h2>Last Raw Messages (Debug)</h2>
+        </div>
+      </div>
+      <pre id="debug"></pre>
+    </div>
+
+    <div class="foot">Aruka / KH-01</div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const TOPICS = {
+      t1: "KH/site-01/KH-01/temperature_probe1",
+      t2: "KH/site-01/KH-01/temperature_probe2",
+      t3: "KH/site-01/KH-01/temperature_probe3",
+      t4: "KH/site-01/KH-01/temperature_probe4",
+      vfd: "KH/site-01/KH-01/vfd_frequency",
+      pwr: "KH/site-01/KH-01/power_consumption",
+      sts: "KH/site-01/KH-01/status",
+    };
+
+    const state = { connected:false, lastUpdate:null, byTopic:{}, staleSeconds:120 };
+
+    const dot = document.getElementById("dot");
+    const connText = document.getElementById("connText");
+    const lastUpdate = document.getElementById("lastUpdate");
+    const debug = document.getElementById("debug");
+
+    const tempCards = document.getElementById("tempCards");
+    const powerCards = document.getElementById("powerCards");
+    const burnerRow = document.getElementById("burnerRow");
+    const vfdCards = document.getElementById("vfdCards");
+
+    function setConnected(ok){
+      state.connected = ok;
+      if(ok){
+        dot.className = "dot ok";
+        connText.textContent = "Connected";
+      } else {
+        dot.className = "dot bad";
+        connText.textContent = "Disconnected";
+      }
+    }
+
+    // ✅ Correct Cambodia time using IANA timezone (no manual +7h)
+    function formatCambodiaTime(isoString){
+      if(!isoString) return "--:--:--";
+      const d = new Date(isoString);
+      return d.toLocaleTimeString("en-US", {
+        timeZone: "Asia/Phnom_Penh",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }).toLowerCase();
+    }
+
+    function parseUtcMs(isoString){
+      if(!isoString) return null;
+      const ms = Date.parse(isoString);
+      return Number.isFinite(ms) ? ms : null;
+    }
+
+    function isStale(isoString){
+      const ms = parseUtcMs(isoString);
+      if(ms === null) return true;
+      return (Date.now() - ms) > (state.staleSeconds * 1000);
+    }
+
+    function safeObj(x){ return (x && typeof x === "object") ? x : null; }
+    function getRec(topic){ return state.byTopic[topic] || null; }
+
+    function cardHTML(label, tag, value, unit, sub, barPct, stale){
+      const pct = Math.max(0, Math.min(100, barPct ?? 40));
+      const tagHtml = stale ? `<span class="tag stale">STALE</span>` : `<span class="tag">${tag}</span>`;
+      return `
+        <div class="card">
+          <div class="label">
+            <span>${label}</span>
+            ${tagHtml}
+          </div>
+          <div class="value">${value}<span class="unit">${unit || ""}</span></div>
+          <div class="sub">${sub || ""}</div>
+          <div class="accentBar"><div style="width:${pct}%"></div></div>
+        </div>
+      `;
+    }
+
+    function renderTemps(){
+      const defs = [
+        {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
+        {topic:TOPICS.t2, title:"Primary Burner", tag:"Probe #2"},
+        {topic:TOPICS.t3, title:"Secondary Burner", tag:"Probe #3"},
+        {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
+      ];
+
+      let html = "";
+      for(const d of defs){
+        const rec = getRec(d.topic);
+        const obj = safeObj(rec?.payload);
+
+        const v = obj?.value ?? "--";
+        const rawUnit = obj?.unit ?? "°C";
+        const unit = (rawUnit === "C") ? "°C" : rawUnit;
+
+        const ts = rec?.received_at; // per-topic timestamp
+        const stale = isStale(ts);
+        const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
+
+        const num = Number(v);
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
+
+        html += cardHTML(d.title, d.tag, v, unit, sub, pct, stale);
+      }
+      tempCards.innerHTML = html;
+    }
+
+    function renderPower(){
+      const rec = getRec(TOPICS.pwr);
+      const obj = safeObj(rec?.payload);
+      const val = safeObj(obj?.value);
+
+      const unit = obj?.unit || "A";
+      const ts = rec?.received_at;
+      const stale = isStale(ts);
+      const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
+
+      const a = val?.phase_A ?? "--";
+      const b = val?.phase_B ?? "--";
+      const c = val?.phase_C ?? "--";
+
+      const defs = [
+        {title:"PHASE A", v:a},
+        {title:"PHASE B", v:b},
+        {title:"PHASE C", v:c},
+      ];
+
+      let html = "";
+      for(const d of defs){
+        const num = Number(d.v);
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 20;
+        html += cardHTML(d.title, "Current", d.v, unit, sub, pct, stale);
+      }
+      powerCards.innerHTML = html;
+    }
+
+    function renderBurners(){
+      const rec = getRec(TOPICS.sts);
+      const obj = safeObj(rec?.payload);
+      const val = safeObj(obj?.value);
+
+      const ts = rec?.received_at;
+      const stale = isStale(ts);
+      const timeLine = ts ? formatCambodiaTime(ts) : "--:--:--";
+
+      const burners = [
+        {k:"bunner1", name:"Burner #1", sub:"Primary"},
+        {k:"bunner3", name:"Burner #3", sub:"Secondary"},
+        {k:"bunner4", name:"Burner #4", sub:"Tertiary"},
+        {k:"bunner6", name:"Burner #6", sub:"Quaternary"},
+      ];
+
+      let html = "";
+      for(const b of burners){
+        const raw = val ? val[b.k] : null;
+        const on = (raw === 1 || raw === true || raw === "1" || raw === "on" || raw === "ON");
+        html += `
+          <div class="burner ${on ? "on" : ""}">
+            <div>
+              <div class="bname">${b.name} ${stale ? '<span class="tag stale" style="margin-left:8px;">STALE</span>' : ''}</div>
+              <div class="bsub">${b.sub} • Updated: ${timeLine}</div>
+            </div>
+            <div class="badge ${on ? "on" : "off"}">${on ? "ON" : "OFF"}</div>
+          </div>
+        `;
+      }
+      burnerRow.innerHTML = html;
+    }
+
+    function renderVFD(){
+      const rec = getRec(TOPICS.vfd);
+      const obj = safeObj(rec?.payload);
+      const val = safeObj(obj?.value);
+
+      const unit = obj?.unit || "Hz";
+      const ts = rec?.received_at;
+      const stale = isStale(ts);
+      const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
+
+      const keys = [
+        ["bucket",     "BUCKET"],
+        ["inlet_screw","INLET SCREW"],
+        ["air_locker", "AIR LOCKER"],
+        ["exhaust1",   "EXHAUST 1"],
+        ["exhaust2",   "EXHAUST 2"],
+        ["out_screw1", "OUTSCREW 1"],
+        ["out_screw2", "OUTSCREW 2"],
+        ["reactor",    "REACTOR"],
+        ["syn_gas",    "SYNGAS"],
+      ];
+
+      let html = "";
+      for(const [k, label] of keys){
+        const v = (val && (k in val)) ? val[k] : "--";
+        const num = Number(v);
+        const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 15;
+        html += cardHTML(label, "VFD", v, unit, sub, pct, stale);
+      }
+      vfdCards.innerHTML = html;
+    }
+
+    function renderAll(){
+      renderTemps();
+      renderPower();
+      renderBurners();
+      renderVFD();
+
+      // global latest update (any topic)
+      lastUpdate.textContent = state.lastUpdate ? formatCambodiaTime(state.lastUpdate) : "--:--:--";
+    }
+
+    function pushDebug(rec){
+      const line = JSON.stringify(rec, null, 2);
+      debug.textContent = (line + "\n\n" + debug.textContent).slice(0, 9000);
+    }
+
+    async function refreshAll(){
+      try {
+        const r = await fetch("/api/state", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+
+        const data = await r.json();
+
+        setConnected(!!data.mqtt.connected);
+        state.lastUpdate = data.last_update_at || null;
+        state.byTopic = data.by_topic || {};
+        state.staleSeconds = data.stale_seconds || 120;
+
+        renderAll();
+      } catch (err) {
+        console.error("Refresh error:", err);
+        setConnected(false);
+      }
+    }
+
+    const socketioClient = io({ path: "/socket.io", transports: ["websocket","polling"] });
+
+    socketioClient.on("connect", () => {
+      console.log("Socket.IO connected");
+      refreshAll();
+    });
+
+    socketioClient.on("disconnect", () => {
+      console.log("Socket.IO disconnected");
+      setConnected(false);
+    });
+
+    socketioClient.on("mqtt_message", (rec) => {
+      state.byTopic[rec.topic] = rec;
+      state.lastUpdate = rec.received_at || null;
+      setConnected(true);
+      renderAll();
+      pushDebug(rec);
+    });
+
+    // Initial load
+    refreshAll();
+
+    // Auto-refresh every 5 seconds (keeps state if socket is slow)
+    setInterval(refreshAll, 5000);
+  </script>
+</body>
+</html>
+"""
+
+# =====================================================
+# LOCAL RUN
+# =====================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
