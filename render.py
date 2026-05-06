@@ -9,10 +9,6 @@ Fixes included:
 - Shows "STALE" badge if a topic hasn't updated within STALE_SECONDS (default 120s)
 """
 
-# gevent monkey-patch MUST be first — before all other imports
-from gevent import monkey
-monkey.patch_all()
-
 import os
 import ssl
 import json
@@ -100,7 +96,7 @@ app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="gevent",
+    async_mode="threading",
     path="socket.io",
     ping_interval=25,
     ping_timeout=60,
