@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
 Aruka / KH-01 Industrial Control Dashboard (Single File)
+
+Fixes included:
+- Correct Cambodia time display using browser timezone "Asia/Phnom_Penh" (no manual +7h math)
+- "Last update" = latest message among ALL topics (global)
+- Each card "Updated" = last message time for THAT topic (per-topic)
+- Shows "STALE" badge if a topic hasn't updated within STALE_SECONDS (default 120s)
 """
+
+# gevent monkey-patch MUST be first — before all other imports
+from gevent import monkey
+monkey.patch_all()
 
 import os
 import ssl
@@ -24,18 +34,14 @@ import paho.mqtt.client as mqtt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOG = logging.getLogger("KH01")
 
-
 # =====================================================
 # HELPERS
 # =====================================================
 def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
-
 def utc_iso_z() -> str:
-    # Always return UTC with Z (stable + parseable on all browsers)
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def safe_json_loads(s: str) -> Any:
     try:
@@ -43,10 +49,8 @@ def safe_json_loads(s: str) -> Any:
     except Exception:
         return s
 
-
 def norm_topic(s: str) -> str:
     return (s or "").strip()
-
 
 # =====================================================
 # CONFIG
@@ -65,6 +69,8 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me").strip()
 MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
 MQTT_RECONNECT_MIN = int(os.environ.get("MQTT_RECONNECT_MIN", "1"))
 MQTT_RECONNECT_MAX = int(os.environ.get("MQTT_RECONNECT_MAX", "30"))
+
+STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "120"))  # show STALE if no update in this many seconds
 
 DEFAULT_TOPICS = [
     "KH/site-01/KH-01/temperature_probe1",
@@ -85,7 +91,6 @@ else:
 HOSTNAME = socket.gethostname()
 CLIENT_ID = f"{BASE_CLIENT_ID}_{HOSTNAME}_{os.getpid()}"
 
-
 # =====================================================
 # FLASK / SOCKETIO
 # =====================================================
@@ -95,12 +100,11 @@ app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",
+    async_mode="gevent",
     path="socket.io",
     ping_interval=25,
     ping_timeout=60,
 )
-
 
 # =====================================================
 # SHARED STATE
@@ -121,10 +125,8 @@ MQTT_STATUS: Dict[str, Any] = {
 }
 
 LAST_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
-LAST_UPDATE_AT: Optional[str] = None
-
+LAST_UPDATE_AT: Optional[str] = None  # global latest received_at (UTC Z)
 mqtt_client: Optional[mqtt.Client] = None
-
 
 # =====================================================
 # MQTT CALLBACKS
@@ -148,7 +150,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
                     MQTT_STATUS["last_error"] = f"subscribe failed: {e}"
         LOG.info(f"Subscribed to {ok}/{len(MQTT_TOPICS)} topics")
 
-
 def on_disconnect(client, userdata, rc, properties=None):
     LOG.warning(f"MQTT on_disconnect rc={rc}")
     with lock:
@@ -156,7 +157,6 @@ def on_disconnect(client, userdata, rc, properties=None):
         MQTT_STATUS["last_disconnect_at"] = utc_iso_z()
         if rc != 0:
             MQTT_STATUS["last_error"] = f"disconnect rc={rc}"
-
 
 def on_message(client, userdata, msg):
     global LAST_UPDATE_AT
@@ -167,13 +167,13 @@ def on_message(client, userdata, msg):
         record = {
             "topic": msg.topic,
             "payload": parsed,
-            "received_at": utc_iso_z(),   # ✅ stable server time (UTC Z)
+            "received_at": utc_iso_z(),  # always UTC Z
             "qos": int(getattr(msg, "qos", 0)),
         }
 
         with lock:
             LAST_BY_TOPIC[msg.topic] = record
-            LAST_UPDATE_AT = record["received_at"]
+            LAST_UPDATE_AT = record["received_at"]  # global latest
 
         socketio.emit("mqtt_message", record)
 
@@ -181,7 +181,6 @@ def on_message(client, userdata, msg):
         LOG.exception("on_message error")
         with lock:
             MQTT_STATUS["last_error"] = f"on_message error: {e}"
-
 
 # =====================================================
 # MQTT WORKER
@@ -205,7 +204,6 @@ def build_mqtt_client() -> mqtt.Client:
     c.on_disconnect = on_disconnect
     c.on_message = on_message
     return c
-
 
 def mqtt_worker():
     global mqtt_client
@@ -240,10 +238,8 @@ def mqtt_worker():
 
             time.sleep(3)
 
-
 _started = False
 _started_lock = threading.Lock()
-
 
 @app.before_request
 def _start_once():
@@ -257,7 +253,6 @@ def _start_once():
         threading.Thread(target=mqtt_worker, daemon=True).start()
         LOG.info("Started MQTT background worker")
 
-
 # =====================================================
 # ROUTES
 # =====================================================
@@ -265,11 +260,9 @@ def _start_once():
 def index():
     return render_template_string(INDEX_HTML)
 
-
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "time_utc": utc_iso_z()})
-
 
 @app.route("/api/state")
 def api_state():
@@ -280,12 +273,12 @@ def api_state():
                 "mqtt": MQTT_STATUS,
                 "last_update_at": LAST_UPDATE_AT,
                 "by_topic": LAST_BY_TOPIC,
+                "stale_seconds": STALE_SECONDS,
             }
         )
 
-
 # =====================================================
-# HTML TEMPLATE - SIMPLIFIED TIMESTAMP FIX
+# HTML TEMPLATE
 # =====================================================
 INDEX_HTML = r"""
 <!doctype html>
@@ -303,6 +296,7 @@ INDEX_HTML = r"""
       --text:#e9eefc;
       --accent:#36d399;
       --danger:#ef4444;
+      --warn:#f59e0b;
       --blue:#60a5fa;
       --cyan:#22d3ee;
     }
@@ -390,10 +384,16 @@ INDEX_HTML = r"""
       padding:14px;
       min-height:92px;
     }
-    .card .label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;}
+    .card .label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;align-items:center;}
     .tag{
       padding:4px 8px;border-radius:999px;border:1px solid var(--line);
       background:rgba(255,255,255,.03);color:rgba(255,255,255,.72);font-size:11px;white-space:nowrap;
+    }
+    .tag.stale{
+      border-color: rgba(245,158,11,.35);
+      color: rgba(245,158,11,.95);
+      background: rgba(245,158,11,.08);
+      font-weight:800;
     }
     .value{margin-top:10px;font-size:34px;font-weight:800;letter-spacing:.4px;}
     .unit{font-size:14px;color:rgba(255,255,255,.75);font-weight:700;margin-left:8px;}
@@ -551,7 +551,7 @@ INDEX_HTML = r"""
       sts: "KH/site-01/KH-01/status",
     };
 
-    const state = { connected:false, lastUpdate:null, byTopic:{} };
+    const state = { connected:false, lastUpdate:null, byTopic:{}, staleSeconds:120 };
 
     const dot = document.getElementById("dot");
     const connText = document.getElementById("connText");
@@ -574,45 +574,42 @@ INDEX_HTML = r"""
       }
     }
 
-    // SIMPLE FIX: Convert UTC to Cambodia time (+7 hours)
-    function formatCambodiaTime(isoString) {
-      if (!isoString) return "--:--:--";
-      
-      try {
-        // Parse the UTC ISO string
-        const date = new Date(isoString);
-        
-        // Add 7 hours for Cambodia time (UTC+7)
-        const cambodiaTime = new Date(date.getTime() + (7 * 60 * 60 * 1000));
-        
-        // Format as HH:MM:SS AM/PM
-        let hours = cambodiaTime.getUTCHours();
-        const minutes = cambodiaTime.getUTCMinutes().toString().padStart(2, '0');
-        const seconds = cambodiaTime.getUTCSeconds().toString().padStart(2, '0');
-        const ampm = hours >= 12 ? 'pm' : 'am';
-        
-        // Convert to 12-hour format
-        hours = hours % 12;
-        hours = hours ? hours : 12; // 0 should be 12
-        
-        return `${hours}:${minutes}:${seconds} ${ampm}`;
-      } catch (e) {
-        console.error("Error formatting time:", e);
-        return "--:--:--";
-      }
+    // ✅ Correct Cambodia time using IANA timezone (no manual +7h)
+    function formatCambodiaTime(isoString){
+      if(!isoString) return "--:--:--";
+      const d = new Date(isoString);
+      return d.toLocaleTimeString("en-US", {
+        timeZone: "Asia/Phnom_Penh",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }).toLowerCase();
+    }
+
+    function parseUtcMs(isoString){
+      if(!isoString) return null;
+      const ms = Date.parse(isoString);
+      return Number.isFinite(ms) ? ms : null;
+    }
+
+    function isStale(isoString){
+      const ms = parseUtcMs(isoString);
+      if(ms === null) return true;
+      return (Date.now() - ms) > (state.staleSeconds * 1000);
     }
 
     function safeObj(x){ return (x && typeof x === "object") ? x : null; }
     function getRec(topic){ return state.byTopic[topic] || null; }
-    function getPayload(topic){ const r = getRec(topic); return r ? r.payload : null; }
 
-    function cardHTML(label, tag, value, unit, sub, barPct){
+    function cardHTML(label, tag, value, unit, sub, barPct, stale){
       const pct = Math.max(0, Math.min(100, barPct ?? 40));
+      const tagHtml = stale ? `<span class="tag stale">STALE</span>` : `<span class="tag">${tag}</span>`;
       return `
         <div class="card">
           <div class="label">
             <span>${label}</span>
-            <span class="tag">${tag}</span>
+            ${tagHtml}
           </div>
           <div class="value">${value}<span class="unit">${unit || ""}</span></div>
           <div class="sub">${sub || ""}</div>
@@ -633,16 +630,19 @@ INDEX_HTML = r"""
       for(const d of defs){
         const rec = getRec(d.topic);
         const obj = safeObj(rec?.payload);
-        const v = obj?.value ?? "--";
-        const unit = obj?.unit ?? "°C";
 
-        // Use the server received time for ALL cards
-        const ts = rec?.received_at;
+        const v = obj?.value ?? "--";
+        const rawUnit = obj?.unit ?? "°C";
+        const unit = (rawUnit === "C") ? "°C" : rawUnit;
+
+        const ts = rec?.received_at; // per-topic timestamp
+        const stale = isStale(ts);
         const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
         const num = Number(v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/900)*100)) : 25;
-        html += cardHTML(d.title, d.tag, v, unit, sub, pct);
+
+        html += cardHTML(d.title, d.tag, v, unit, sub, pct, stale);
       }
       tempCards.innerHTML = html;
     }
@@ -654,11 +654,12 @@ INDEX_HTML = r"""
 
       const unit = obj?.unit || "A";
       const ts = rec?.received_at;
+      const stale = isStale(ts);
       const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
-      const a = val?.phaseA ?? "--";
-      const b = val?.phaseB ?? "--";
-      const c = val?.phaseC ?? "--";
+      const a = val?.phase_A ?? "--";
+      const b = val?.phase_B ?? "--";
+      const c = val?.phase_C ?? "--";
 
       const defs = [
         {title:"PHASE A", v:a},
@@ -670,7 +671,7 @@ INDEX_HTML = r"""
       for(const d of defs){
         const num = Number(d.v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 20;
-        html += cardHTML(d.title, "Current", d.v, unit, sub, pct);
+        html += cardHTML(d.title, "Current", d.v, unit, sub, pct, stale);
       }
       powerCards.innerHTML = html;
     }
@@ -681,13 +682,14 @@ INDEX_HTML = r"""
       const val = safeObj(obj?.value);
 
       const ts = rec?.received_at;
+      const stale = isStale(ts);
       const timeLine = ts ? formatCambodiaTime(ts) : "--:--:--";
 
       const burners = [
-        {k:"burner1", name:"Burner #1", sub:"Primary"},
-        {k:"burner3", name:"Burner #3", sub:"Secondary"},
-        {k:"burner4", name:"Burner #4", sub:"Tertiary"},
-        {k:"burner6", name:"Burner #6", sub:"Quaternary"},
+        {k:"bunner1", name:"Burner #1", sub:"Primary"},
+        {k:"bunner3", name:"Burner #3", sub:"Secondary"},
+        {k:"bunner4", name:"Burner #4", sub:"Tertiary"},
+        {k:"bunner6", name:"Burner #6", sub:"Quaternary"},
       ];
 
       let html = "";
@@ -697,7 +699,7 @@ INDEX_HTML = r"""
         html += `
           <div class="burner ${on ? "on" : ""}">
             <div>
-              <div class="bname">${b.name}</div>
+              <div class="bname">${b.name} ${stale ? '<span class="tag stale" style="margin-left:8px;">STALE</span>' : ''}</div>
               <div class="bsub">${b.sub} • Updated: ${timeLine}</div>
             </div>
             <div class="badge ${on ? "on" : "off"}">${on ? "ON" : "OFF"}</div>
@@ -714,18 +716,19 @@ INDEX_HTML = r"""
 
       const unit = obj?.unit || "Hz";
       const ts = rec?.received_at;
+      const stale = isStale(ts);
       const sub = ts ? ("Updated: " + formatCambodiaTime(ts)) : "Waiting for data...";
 
       const keys = [
-        ["Bucket", "BUCKET"],
-        ["INLETScrew", "INLET SCREW"],
-        ["air locker", "AIR LOCKER"],
-        ["exaust1", "EXHAUST 1"],
-        ["exaust2", "EXHAUST 2"],
-        ["outscrew1", "OUTSCREW 1"],
-        ["outscrew2", "OUTSCREW 2"],
-        ["reactor", "REACTOR"],
-        ["syn gas", "SYNGAS"],
+        ["bucket",     "BUCKET"],
+        ["inlet_screw","INLET SCREW"],
+        ["air_locker", "AIR LOCKER"],
+        ["exhaust1",   "EXHAUST 1"],
+        ["exhaust2",   "EXHAUST 2"],
+        ["out_screw1", "OUTSCREW 1"],
+        ["out_screw2", "OUTSCREW 2"],
+        ["reactor",    "REACTOR"],
+        ["syn_gas",    "SYNGAS"],
       ];
 
       let html = "";
@@ -733,7 +736,7 @@ INDEX_HTML = r"""
         const v = (val && (k in val)) ? val[k] : "--";
         const num = Number(v);
         const pct = isFinite(num) ? Math.max(5, Math.min(100, (num/100)*100)) : 15;
-        html += cardHTML(label, "VFD", v, unit, sub, pct);
+        html += cardHTML(label, "VFD", v, unit, sub, pct, stale);
       }
       vfdCards.innerHTML = html;
     }
@@ -744,7 +747,7 @@ INDEX_HTML = r"""
       renderBurners();
       renderVFD();
 
-      // Update top bar with last update time (in Cambodia time)
+      // global latest update (any topic)
       lastUpdate.textContent = state.lastUpdate ? formatCambodiaTime(state.lastUpdate) : "--:--:--";
     }
 
@@ -757,15 +760,14 @@ INDEX_HTML = r"""
       try {
         const r = await fetch("/api/state", { cache: "no-store" });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        
+
         const data = await r.json();
 
         setConnected(!!data.mqtt.connected);
-        
-        // Update state with server data
         state.lastUpdate = data.last_update_at || null;
         state.byTopic = data.by_topic || {};
-        
+        state.staleSeconds = data.stale_seconds || 120;
+
         renderAll();
       } catch (err) {
         console.error("Refresh error:", err);
@@ -779,14 +781,13 @@ INDEX_HTML = r"""
       console.log("Socket.IO connected");
       refreshAll();
     });
-    
+
     socketioClient.on("disconnect", () => {
       console.log("Socket.IO disconnected");
       setConnected(false);
     });
 
     socketioClient.on("mqtt_message", (rec) => {
-      console.log("MQTT message received:", rec.topic);
       state.byTopic[rec.topic] = rec;
       state.lastUpdate = rec.received_at || null;
       setConnected(true);
@@ -796,14 +797,13 @@ INDEX_HTML = r"""
 
     // Initial load
     refreshAll();
-    
-    // Auto-refresh every 5 seconds
+
+    // Auto-refresh every 5 seconds (keeps state if socket is slow)
     setInterval(refreshAll, 5000);
   </script>
 </body>
 </html>
 """
-
 
 # =====================================================
 # LOCAL RUN
