@@ -616,10 +616,10 @@ INDEX_HTML = r"""
 
     function renderTemps(){
       const defs = [
-        {topic:TOPICS.t1, title:"Reactor (outscrew)", tag:"Probe #1"},
+        {topic:TOPICS.t1, title:"Reactor (end)", tag:"Probe #1"},
         {topic:TOPICS.t2, title:"Primary Burner", tag:"Probe #2"},
         {topic:TOPICS.t3, title:"Secondary Burner", tag:"Probe #3"},
-        {topic:TOPICS.t4, title:"Reactor (end)", tag:"Probe #4"},
+        {topic:TOPICS.t4, title:"Reactor (outscrew)", tag:"Probe #4"},
       ];
 
       let html = "";
